@@ -2,7 +2,7 @@
 
 基于 Vulkan Compute 的深度学习计算基础库，目标是提供类似 cuBLAS 的矩阵计算能力与类似 cuDNN 的神经网络算子能力，为推理和训练框架提供跨 GPU 厂商的底层计算后端。
 
-> 当前处于运行时开发初期，已实现 Vulkan 1.2 设备查询、上下文、显存分配/释放、同步上传/下载/设备内复制、字节填充和同步，并提供动态库和 C 接口测试。尚无计算算子或性能数据。实现顺序和验收标准见 [开发计划](PLAN.md)。
+> 已实现 Vulkan 1.2 运行时、FP32 列主序 tiled SGEMM，以及 FP32 连续 NCHW 的直接二维卷积（batch/groups/depthwise、padding/stride/dilation、卷积核翻转）、AddTensor 偏置/逐轴广播及残差加法、ReLU/Sigmoid/tanh、最大/平均池化、稳定 Softmax/LogSoftmax 真实 GPU 前向。卷积选择 `VKDNN_CONVOLUTION_FWD_ALGO_DIRECT`，workspace 为零；IMPLICIT_GEMM 保留但不支持。专用反向、网络示例、预训练参数与完整训练仍未实现，暂无性能数据。实现顺序和验收标准见 [开发计划](PLAN.md)。
 
 ## 项目定位
 
@@ -15,7 +15,9 @@
 
 ## 能力路线
 
-基本 CNN 的前向/反向算子与参考接口见 [CNN 算子清单](docs/CNN_OPERATORS.md)。当前已增加 [DNN 头文件](include/vkdnn/vkdnn_ops.h) 和 [BLAS 头文件](include/vkdnn/vkblas.h)，这些新增接口全部为返回 `NOT_SUPPORTED` 的桩，不代表已有 CNN 计算能力。
+基本 CNN 的前向/反向算子与参考接口见 [CNN 算子清单及 LeNet 缺口](docs/CNN_OPERATORS.md)。[DNN 头文件](include/vkdnn/vkdnn_ops.h) 中句柄、tensor/filter/convolution/activation/pooling 描述符及卷积、AddTensor、激活、池化、softmax 前向已实现，支持 batch、alpha/beta，确切 NaN/布局/别名限制见该文档；其余 DNN 仍返回 `NOT_SUPPORTED`。[BLAS](include/vkdnn/vkblas.h) 已实现同步 FP32 SGEMM、N/T/C、padded leading dimension 与宿主 alpha/beta；设备 scalar pointer mode 暂不支持。
+
+已在 [third_party/ncnn](third_party/ncnn/README.md) 保存固定版本参考快照，保留上游 BSD-3-Clause 许可；不参与构建。`src/ops/forward.comp` 和宿主调度为独立实现，构建期使用 Vulkan SDK `glslc` 生成嵌入式 SPIR-V，运行时无需 shader 文件或编译器。
 
 以下均为规划内容，具体支持范围以未来发布版本为准。
 
@@ -33,7 +35,7 @@
 
 - **宿主端**：C++17 实现，规划以 C ABI 暴露不透明句柄和显式状态码，便于其他语言或框架绑定。
 - **GPU 端**：以 GLSL compute shader 编译到 SPIR-V 为起点；优化路径不得成为通用路径的隐式依赖。
-- **构建**：计划采用 CMake，构建时编译 shader，运行时不要求部署 shader 编译器。
+- **构建**：采用 CMake，构建时编译 shader，运行时不要求部署 shader 编译器。
 - **Vulkan 基线**：暂定 Vulkan 1.2 Compute，具体 feature/limit 要求在最小运行时阶段固化；不要求 graphics queue 或显示窗口。
 - **平台**：先在 Windows 完成开发闭环，再验证 Linux；其他平台在完成实际设备验证前不承诺支持。
 - **精度**：FP32 优先；FP16/BF16 与矩阵硬件加速作为能力驱动的可选路径，分别验证存储、运算及累加精度。
@@ -57,7 +59,15 @@
 
 ## 构建与使用
 
-构建需要 CMake 3.20+、C11 和 C++17 编译器，以及 Vulkan SDK 提供的头文件和加载器链接库。CMake 使用 `find_package(Vulkan REQUIRED)` 和 `Vulkan::Vulkan`，不再自动下载头文件。Windows 可通过 `VULKAN_SDK` 指向 SDK 根目录；安装后可能需要重启终端以刷新环境变量。运行时直接依赖 `vulkan-1.dll`（Linux 为 Vulkan loader 共享库）和兼容驱动，不再使用 `LoadLibrary`/`dlopen` 手动加载；缺少 DLL 时系统会拒绝加载本库，而不是返回状态码。使用 CMake 构建并通过 CTest 验证：
+### Visual Studio 原生工程
+
+直接打开根目录的 [vkdnn.sln](vkdnn.sln)，工程文件位于 [src/vkdnn.vcxproj](src/vkdnn.vcxproj)。支持 Debug/Release x64，当前工具集为 Visual Studio 2026 的 v145；需要安装 C++ 桌面开发工具、Windows SDK 和 Vulkan SDK，并设置 `VULKAN_SDK`。工程直接编译动态库和三个自有 compute shader，不依赖 CMake 生成工程，不编译 ncnn 参考代码。
+
+输出位于 `build/vs/x64/Debug` 或 `build/vs/x64/Release`，包含 `vkdnn.dll` 和导入库 `vkdnn.lib`。原生解决方案目前仅包含库目标；完整测试继续使用下述 CMake 工程。新增源码或 shader 时须同步维护两套工程列表。
+
+### CMake 构建与测试
+
+构建需要 CMake 3.20+、C11 和 C++17 编译器，以及 Vulkan SDK 提供的头文件、加载器链接库和 `glslc`。CMake 使用 `find_package(Vulkan REQUIRED)` 和 `Vulkan::Vulkan`，不再自动下载头文件。Windows 可通过 `VULKAN_SDK` 指向 SDK 根目录，也可用 `-DVKDNN_GLSLC=绝对路径` 指定 shader 编译器；安装后可能需要重启终端以刷新环境变量。运行时直接依赖 `vulkan-1.dll`（Linux 为 Vulkan loader 共享库）和兼容驱动，不再使用 `LoadLibrary`/`dlopen` 手动加载；缺少 DLL 时系统会拒绝加载本库，而不是返回状态码。使用 CMake 构建并通过 CTest 验证：
 
 ```powershell
 cmake -S . -B build
@@ -88,7 +98,7 @@ ctest --test-dir build -C Debug --output-on-failure
 
 表中运行时接口均已实现。显存使用 device-local buffer，主机传输使用 host-visible staging buffer，处理非 coherent 内存的 flush/invalidate。支持任意字节偏移和长度；4 字节对齐的设备内复制直接执行 GPU transfer，非对齐路径暂经主机中转，上传非对齐边界时保留相邻字节。当前 memset 同样经主机 staging 实现，尚未进行性能优化。
 
-复制调用同步完成，校验方向、容量和范围，重叠复制返回错误。设备地址释放或 reset 后不可继续使用。详细契约见头文件注释。测试覆盖五种复制方向、指针偏移、边界保护、错误参数、重复分配释放及 reset 后重新创建。shader 构建规则及跨平台、跨设备支持清单尚未落地。
+复制调用同步完成，校验方向、容量和范围，重叠复制返回错误。设备地址释放或 reset 后不可继续使用。详细契约见头文件注释。测试覆盖五种复制方向、指针偏移、边界保护、错误参数、重复分配释放及 reset 后重新创建。已有 shader 构建规则；跨平台、跨设备支持清单尚未落地。
 
 ```c
 void* device = NULL;

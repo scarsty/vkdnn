@@ -8,8 +8,11 @@
 - 基础运行时使用 `vkdnnError_t`、`vkdnnSuccess`、`vkdnnError...` 和 `vkdnnMemcpyKind`；复制统一为带方向枚举的 `vkdnnMemcpy`。
 - 保持 CUDA 风格的当前设备、隐式运行时上下文与 `void*` 显存地址，不重新向基础内存 API 增加显式上下文、内存句柄或 offset 参数。BLAS/DNN 层仍参考各自库的显式句柄和描述符模式。
 - 底层只用 Vulkan 实现，不添加 CUDA/cuBLAS/cuDNN 运行依赖；不宣称 ABI 兼容，不虚构 Vulkan 无法提供的 CUDA 能力。必要偏离应明确说明并测试。
+- ncnn 仅作算法和 Vulkan 实践参考，自行实现本工程 shader 与调度；不得直接编译 ncnn 源码或引入其内部类型/宏依赖。已有 third_party/ncnn 是参考快照，不是已实现算子，不能把下载源码当作完成功能。
 - API 变更同步更新实现、调用方、测试及文档；保留 C ABI，验证动态库导出。
 - 修改 C/C++ 或 CUDA 代码后，使用 `C:\project\_clang-format` 格式化本次修改文件，并通过 `--dry-run --Werror`；保留编码和 BOM，禁止嵌套三元表达式。
+- 自有 `.comp` shader 也必须使用上述规则按 C++ 模式 clang-format（标准输入配合 `--assume-filename=shader.cpp`），同模式严格校验，并重新编译及测试；不批量改动第三方参考快照。
+- GLSL 必须单独覆盖 `RemoveSemicolon: false`，避免 C++ 格式化删除 buffer block 的必要分号；具体继承命令见 DEVELOPMENT.md。
 - GPU 相关改动需运行实际测试，资源/同步改动应启用 Vulkan validation layers；设备不可用时报告跳过，不能冒充通过。
 
 ## 已确认决策

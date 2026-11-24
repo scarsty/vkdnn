@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{492544CE-195C-4A13-8D91-85A59DA87DE3}</ProjectGuid>
+    <RootNamespace>vkdnn</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\build\vs\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(OutDir)obj\</IntDir>
+    <TargetName>vkdnn</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level3</WarningLevel>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\include;$(IntDir)generated;$(VULKAN_SDK)\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>VKDNN_BUILDING_LIBRARY;WIN32;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <Optimization Condition="'$(Configuration)'=='Debug'">Disabled</Optimization>
+      <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(VULKAN_SDK)\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>vulkan-1.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="core\runtime.cpp" />
+    <ClCompile Include="core\vkdnn.cpp" />
+    <ClCompile Include="ops\cnn_stubs.cpp" />
+    <ClCompile Include="ops\forward.cpp" />
+    <ClCompile Include="ops\gemm.cpp" />
+    <ClInclude Include="core\compute_internal.h" />
+    <ClInclude Include="core\runtime_internal.h" />
+    <ClInclude Include="..\include\vkdnn\vkdnn.h" />
+    <ClInclude Include="..\include\vkdnn\vkdnn_ops.h" />
+    <ClInclude Include="..\include\vkdnn\vkblas.h" />
+    <None Include="ops\forward.comp" />
+    <None Include="ops\gemm.comp" />
+    <None Include="ops\convolution.comp" />
+  </ItemGroup>
+  <Target Name="ValidateVulkanSDK" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(VULKAN_SDK)\Include\vulkan\vulkan.h')" Text="Set VULKAN_SDK to a Vulkan SDK directory containing Include\vulkan\vulkan.h." />
+    <Error Condition="!Exists('$(VULKAN_SDK)\Bin\glslc.exe')" Text="VULKAN_SDK must contain Bin\glslc.exe." />
+  </Target>
+  <Target Name="CompileComputeShaders" BeforeTargets="ClCompile"
+          Inputs="$(MSBuildThisFileDirectory)ops\forward.comp;$(MSBuildThisFileDirectory)ops\gemm.comp;$(MSBuildThisFileDirectory)ops\convolution.comp"
+          Outputs="$(IntDir)generated\forward_spv.inc;$(IntDir)generated\gemm_spv.inc;$(IntDir)generated\convolution_spv.inc">
+    <MakeDir Directories="$(IntDir)generated" />
+    <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\forward.comp&quot; -o &quot;$(IntDir)generated\forward_spv.inc&quot;" />
+    <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\gemm.comp&quot; -o &quot;$(IntDir)generated\gemm_spv.inc&quot;" />
+    <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\convolution.comp&quot; -o &quot;$(IntDir)generated\convolution_spv.inc&quot;" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

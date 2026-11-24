@@ -13,6 +13,18 @@
 #include <utility>
 #include <vector>
 
+static const uint32_t forwardSpirv[] =
+#include "forward_spv.inc"
+    ;
+static const uint32_t gemmSpirv[] =
+#include "gemm_spv.inc"
+    ;
+static const uint32_t convolutionSpirv[] =
+#include "convolution_spv.inc"
+    ;
+
+namespace vkdnnRuntime
+{
 struct vkdnnMemory
 {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -44,6 +56,221 @@ struct vkdnnContext
         if (instance) { vkDestroyInstance(instance, nullptr); }
     }
 };
+
+}    //namespace vkdnnRuntime
+using namespace vkdnnRuntime;
+
+static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory, uint32_t bufferCount,
+    const uint32_t* code, size_t codeSize, const void* params, uint32_t paramSize, uint32_t groups, uint32_t groupsY)
+{
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(context->physical, &properties);
+    if (paramSize > properties.limits.maxPushConstantsSize
+        || groups > properties.limits.maxComputeWorkGroupCount[0]
+        || groupsY > properties.limits.maxComputeWorkGroupCount[1])
+    {
+        return vkdnnErrorNotSupported;
+    }
+    for (uint32_t i = 0; i < bufferCount; ++i)
+    {
+        if (memory[i]->size > properties.limits.maxStorageBufferRange) { return vkdnnErrorNotSupported; }
+    }
+    struct Resources
+    {
+        VkDevice device;
+        VkShaderModule shader = VK_NULL_HANDLE;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        ~Resources()
+        {
+            if (pool)
+            {
+                vkDestroyDescriptorPool(device, pool, nullptr);
+            }
+            if (pipeline)
+            {
+                vkDestroyPipeline(device, pipeline, nullptr);
+            }
+            if (layout)
+            {
+                vkDestroyPipelineLayout(device, layout, nullptr);
+            }
+            if (setLayout)
+            {
+                vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+            }
+            if (shader)
+            {
+                vkDestroyShaderModule(device, shader, nullptr);
+            }
+        }
+    } r{ context->device };
+    auto status = [](VkResult result)
+    {
+        if (result == VK_SUCCESS)
+        {
+            return vkdnnSuccess;
+        }
+        if (result == VK_ERROR_DEVICE_LOST)
+        {
+            return vkdnnErrorDeviceLost;
+        }
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY)
+        {
+            return vkdnnErrorMemoryAllocation;
+        }
+        return vkdnnErrorUnknown;
+    };
+    VkShaderModuleCreateInfo shader{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    shader.codeSize = codeSize;
+    shader.pCode = code;
+    VkResult result = vkCreateShaderModule(r.device, &shader, nullptr, &r.shader);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkDescriptorSetLayoutBinding bindings[3]{};
+    for (uint32_t i = 0; i < bufferCount; ++i)
+    {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo setInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    setInfo.bindingCount = bufferCount;
+    setInfo.pBindings = bindings;
+    result = vkCreateDescriptorSetLayout(r.device, &setInfo, nullptr, &r.setLayout);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkPushConstantRange push{ VK_SHADER_STAGE_COMPUTE_BIT, 0, paramSize };
+    VkPipelineLayoutCreateInfo layout{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    layout.setLayoutCount = 1;
+    layout.pSetLayouts = &r.setLayout;
+    layout.pushConstantRangeCount = 1;
+    layout.pPushConstantRanges = &push;
+    result = vkCreatePipelineLayout(r.device, &layout, nullptr, &r.layout);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkComputePipelineCreateInfo pipeline{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline.stage.module = r.shader;
+    pipeline.stage.pName = "main";
+    pipeline.layout = r.layout;
+    result = vkCreateComputePipelines(r.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &r.pipeline);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bufferCount };
+    VkDescriptorPoolCreateInfo pool{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pool.maxSets = 1;
+    pool.poolSizeCount = 1;
+    pool.pPoolSizes = &poolSize;
+    result = vkCreateDescriptorPool(r.device, &pool, nullptr, &r.pool);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkDescriptorSetAllocateInfo allocate{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocate.descriptorPool = r.pool;
+    allocate.descriptorSetCount = 1;
+    allocate.pSetLayouts = &r.setLayout;
+    VkDescriptorSet set;
+    result = vkAllocateDescriptorSets(r.device, &allocate, &set);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkDescriptorBufferInfo buffers[3]{};
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < bufferCount; ++i)
+    {
+        buffers[i] = { memory[i]->buffer, 0, memory[i]->size };
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffers[i];
+    }
+    vkUpdateDescriptorSets(r.device, bufferCount, writes, 0, nullptr);
+    result = vkResetCommandPool(r.device, context->pool, 0);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(context->command, &begin);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipeline);
+    vkCmdBindDescriptorSets(context->command, VK_PIPELINE_BIND_POINT_COMPUTE, r.layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(context->command, r.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, paramSize, params);
+    vkCmdDispatch(context->command, groups, groupsY, 1);
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    result = vkEndCommandBuffer(context->command);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    result = vkResetFences(r.device, 1, &context->fence);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &context->command;
+    result = vkQueueSubmit(context->queue, 1, &submit, context->fence);
+    if (result != VK_SUCCESS)
+    {
+        return status(result);
+    }
+    return status(vkWaitForFences(r.device, 1, &context->fence, VK_TRUE, UINT64_MAX));
+}
+
+vkdnnError_t vkdnnRuntime::computeBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t y, const ComputeParams& params)
+{
+    vkdnnMemory_t buffers[] = { x, y };
+    return dispatchBuffers(context, buffers, 2, forwardSpirv, sizeof(forwardSpirv), &params, sizeof(params), (params.count + 63u) / 64u, 1);
+}
+
+vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t w, vkdnnMemory_t y, const ConvolutionParams& params)
+{
+    vkdnnMemory_t buffers[] = { x, w, y };
+    return dispatchBuffers(context, buffers, 3, convolutionSpirv, sizeof(convolutionSpirv), &params, sizeof(params), (params.count + 63u) / 64u, 1);
+}
+
+vkdnnError_t vkdnnRuntime::gemmBuffers(vkdnnHandle_t context, vkdnnMemory_t a, vkdnnMemory_t b, vkdnnMemory_t c, const GemmParams& params)
+{
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(context->physical, &properties);
+    if (properties.limits.maxComputeWorkGroupInvocations < 256
+        || properties.limits.maxComputeWorkGroupSize[0] < 16 || properties.limits.maxComputeWorkGroupSize[1] < 16
+        || properties.limits.maxComputeSharedMemorySize < 2048)
+    {
+        return vkdnnErrorNotSupported;
+    }
+    vkdnnMemory_t buffers[] = { a, b, c };
+    return dispatchBuffers(context, buffers, 3, gemmSpirv, sizeof(gemmSpirv), &params, sizeof(params), (params.m + 15u) / 16u, (params.n + 15u) / 16u);
+}
 
 namespace
 {
@@ -407,7 +634,7 @@ vkdnnStatus_t vkdnnGetDeviceProperties(vkdnnDeviceProp* properties, int device)
     }
 }
 
-vkdnnStatus_t createContext(vkdnnHandle_t* handle, int device)
+vkdnnStatus_t vkdnnRuntime::createContext(vkdnnHandle_t* handle, int device)
 {
     if (!handle || device < 0) { return VKDNN_STATUS_INVALID_VALUE; }
     try
@@ -512,7 +739,7 @@ vkdnnStatus_t createContext(vkdnnHandle_t* handle, int device)
     }
 }
 
-vkdnnStatus_t destroyContext(vkdnnHandle_t handle)
+vkdnnStatus_t vkdnnRuntime::destroyContext(vkdnnHandle_t handle)
 {
     if (!handle || !handle->allocations.empty()) { return VKDNN_STATUS_INVALID_VALUE; }
     auto status = resultStatus(vkDeviceWaitIdle(handle->device));
@@ -521,13 +748,13 @@ vkdnnStatus_t destroyContext(vkdnnHandle_t handle)
     return status;
 }
 
-vkdnnStatus_t synchronizeContext(vkdnnHandle_t handle)
+vkdnnStatus_t vkdnnRuntime::synchronizeContext(vkdnnHandle_t handle)
 {
     if (!handle) { return VKDNN_STATUS_INVALID_VALUE; }
     return resultStatus(vkDeviceWaitIdle(handle->device));
 }
 
-vkdnnStatus_t allocateMemory(vkdnnHandle_t handle, vkdnnMemory_t* memory, size_t bytes)
+vkdnnStatus_t vkdnnRuntime::allocateMemory(vkdnnHandle_t handle, vkdnnMemory_t* memory, size_t bytes)
 {
     if (!handle || !memory || !bytes || bytes > std::numeric_limits<size_t>::max() - 3)
     {
@@ -552,7 +779,7 @@ vkdnnStatus_t allocateMemory(vkdnnHandle_t handle, vkdnnMemory_t* memory, size_t
     } catch (const std::bad_alloc&) { return VKDNN_STATUS_OUT_OF_MEMORY; }
 }
 
-vkdnnStatus_t freeMemory(vkdnnHandle_t handle, vkdnnMemory_t memory)
+vkdnnStatus_t vkdnnRuntime::freeMemory(vkdnnHandle_t handle, vkdnnMemory_t memory)
 {
     if (!handle || !memory || !handle->allocations.count(memory)) { return VKDNN_STATUS_INVALID_VALUE; }
     releaseBuffer(handle, *memory);
@@ -561,19 +788,19 @@ vkdnnStatus_t freeMemory(vkdnnHandle_t handle, vkdnnMemory_t memory)
     return VKDNN_STATUS_SUCCESS;
 }
 
-vkdnnStatus_t copyHtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t offset, const void* src, size_t bytes)
+vkdnnStatus_t vkdnnRuntime::copyHtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t offset, const void* src, size_t bytes)
 {
     if (!src || !validRange(handle, dst, offset, bytes)) { return VKDNN_STATUS_INVALID_VALUE; }
     return transfer(handle, dst, offset, const_cast<void*>(src), bytes, true);
 }
 
-vkdnnStatus_t copyDtoH(vkdnnHandle_t handle, void* dst, vkdnnMemory_t src, size_t offset, size_t bytes)
+vkdnnStatus_t vkdnnRuntime::copyDtoH(vkdnnHandle_t handle, void* dst, vkdnnMemory_t src, size_t offset, size_t bytes)
 {
     if (!dst || !validRange(handle, src, offset, bytes)) { return VKDNN_STATUS_INVALID_VALUE; }
     return transfer(handle, src, offset, dst, bytes, false);
 }
 
-vkdnnStatus_t copyDtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t dstOffset, vkdnnMemory_t src, size_t srcOffset, size_t bytes)
+vkdnnStatus_t vkdnnRuntime::copyDtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t dstOffset, vkdnnMemory_t src, size_t srcOffset, size_t bytes)
 {
     if (!validRange(handle, dst, dstOffset, bytes) || !validRange(handle, src, srcOffset, bytes))
     {
@@ -597,7 +824,7 @@ vkdnnStatus_t copyDtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t dstOffset
     } catch (const std::bad_alloc&) { return VKDNN_STATUS_OUT_OF_MEMORY; }
 }
 
-vkdnnStatus_t setMemory(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset, int value, size_t bytes)
+vkdnnStatus_t vkdnnRuntime::setMemory(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset, int value, size_t bytes)
 {
     if (!validRange(handle, memory, offset, bytes)) { return VKDNN_STATUS_INVALID_VALUE; }
     if (!bytes) { return VKDNN_STATUS_SUCCESS; }

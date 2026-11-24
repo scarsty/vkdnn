@@ -73,7 +73,8 @@ typedef enum vkdnnSoftmaxMode_t
 /* Initial algorithm subset, not a promise of implemented algorithms. */
 typedef enum vkdnnConvolutionFwdAlgo_t
 {
-    VKDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM = 0
+    VKDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM = 0,
+    VKDNN_CONVOLUTION_FWD_ALGO_DIRECT = 3
 } vkdnnConvolutionFwdAlgo_t;
 typedef enum vkdnnConvolutionBwdDataAlgo_t
 {
@@ -84,9 +85,9 @@ typedef enum vkdnnConvolutionBwdFilterAlgo_t
     VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0 = 0
 } vkdnnConvolutionBwdFilterAlgo_t;
 
-/* All declarations below are cuDNN-style stubs. Every call returns NOT_SUPPORTED
- * without parameter validation, output writes, resource creation or GPU work.
- * Future initial implementation targets FP32; enum presence is not dtype support. */
+/* Implemented: handle/tensor/filter/convolution/ReLU/sigmoid/tanh/pooling descriptors and their forward calls,
+ * AddTensor broadcasting and ACCURATE/LOG softmax. FP32 contiguous NCHW only; see CNN_OPERATORS.md.
+ * Other calls remain NOT_SUPPORTED stubs without output writes or GPU work. */
 VKDNN_API vkdnnStatus_t vkdnnCreate(vkdnnHandle_t* handle);
 VKDNN_API vkdnnStatus_t vkdnnDestroy(vkdnnHandle_t handle);
 VKDNN_API vkdnnStatus_t vkdnnCreateTensorDescriptor(vkdnnTensorDescriptor_t* tensorDesc);
@@ -128,6 +129,9 @@ VKDNN_API vkdnnStatus_t vkdnnConvolutionBackwardFilter(vkdnnHandle_t handle, con
     void* workSpace, size_t workSpaceSizeInBytes, const void* beta, vkdnnFilterDescriptor_t dwDesc, void* dw);
 VKDNN_API vkdnnStatus_t vkdnnConvolutionBackwardBias(vkdnnHandle_t handle, const void* alpha,
     vkdnnTensorDescriptor_t dyDesc, const void* dy, const void* beta, vkdnnTensorDescriptor_t dbDesc, void* db);
+/* C=alpha*A+beta*C; each A dimension equals C or 1. Host float scalars.
+ * alpha=0 skips A access/validation; beta=0 skips old C reads. Actual A/C overlap is rejected.
+ * Registered, float-aligned device ranges only; errors leave C unchanged. */
 VKDNN_API vkdnnStatus_t vkdnnAddTensor(vkdnnHandle_t handle, const void* alpha,
     vkdnnTensorDescriptor_t aDesc, const void* A, const void* beta, vkdnnTensorDescriptor_t cDesc, void* C);
 VKDNN_API vkdnnStatus_t vkdnnCreateActivationDescriptor(vkdnnActivationDescriptor_t* activationDesc);

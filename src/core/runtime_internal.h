@@ -1,7 +1,10 @@
 #pragma once
 
+#include "compute_internal.h"
 #include "vkdnn/vkdnn.h"
 
+namespace vkdnnRuntime
+{
 using vkdnnStatus_t = vkdnnError_t;
 using vkdnnHandle_t = struct vkdnnContext*;
 using vkdnnMemory_t = struct vkdnnMemory*;
@@ -23,3 +26,7 @@ vkdnnStatus_t copyHtoD(vkdnnHandle_t, vkdnnMemory_t, size_t, const void*, size_t
 vkdnnStatus_t copyDtoH(vkdnnHandle_t, void*, vkdnnMemory_t, size_t, size_t);
 vkdnnStatus_t copyDtoD(vkdnnHandle_t, vkdnnMemory_t, size_t, vkdnnMemory_t, size_t, size_t);
 vkdnnStatus_t setMemory(vkdnnHandle_t, vkdnnMemory_t, size_t, int, size_t);
+vkdnnError_t computeBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, const ComputeParams&);
+vkdnnError_t gemmBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const GemmParams&);
+vkdnnError_t convolutionBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ConvolutionParams&);
+}    //namespace vkdnnRuntime

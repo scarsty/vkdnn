@@ -1,0 +1,50 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer MatrixA { float a[]; };
+layout(binding = 1) readonly buffer MatrixB { float b[]; };
+layout(binding = 2) buffer MatrixC { float c[]; };
+layout(push_constant) uniform Parameters
+{
+    uint m, n, k, lda, ldb, ldc, transa, transb;
+    uint aOffset, bOffset, cOffset;
+    float alpha, beta;
+}
+p;
+shared float tileA[16][16];
+shared float tileB[16][16];
+void main()
+{
+    uint x = gl_LocalInvocationID.x, y = gl_LocalInvocationID.y;
+    uint row = gl_GlobalInvocationID.x, col = gl_GlobalInvocationID.y;
+    float sum = 0.0;
+    for (uint base = 0; base < p.k; base += 16)
+    {
+        uint ak = base + y, bk = base + x;
+        float av = 0.0, bv = 0.0;
+        if (row < p.m && ak < p.k)
+        {
+            uint index = row + ak * p.lda;
+            if (p.transa != 0) { index = ak + row * p.lda; }
+            av = a[p.aOffset + index];
+        }
+        if (bk < p.k && col < p.n)
+        {
+            uint index = bk + col * p.ldb;
+            if (p.transb != 0) { index = col + bk * p.ldb; }
+            bv = b[p.bOffset + index];
+        }
+        tileA[x][y] = av;
+        tileB[x][y] = bv;
+        barrier();
+        for (uint j = 0; j < 16; ++j) { sum += tileA[x][j] * tileB[j][y]; }
+        barrier();
+    }
+    if (row < p.m && col < p.n)
+    {
+        uint index = p.cOffset + row + col * p.ldc;
+        float value = 0.0;
+        if (p.k != 0) { value = p.alpha * sum; }
+        if (p.beta != 0.0) { value += p.beta * c[index]; }
+        c[index] = value;
+    }
+}
