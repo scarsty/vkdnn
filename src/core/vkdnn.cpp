@@ -1,0 +1,609 @@
+#include "runtime_internal.h"
+
+#include <vulkan/vulkan.h>
+
+#include <array>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <system_error>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+struct vkdnnMemory
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory allocation = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
+    VkDeviceSize capacity = 0;
+};
+
+struct vkdnnContext
+{
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    int index = -1;
+    std::unordered_set<vkdnnMemory_t> allocations;
+
+    ~vkdnnContext()
+    {
+        if (device)
+        {
+            if (fence) { vkDestroyFence(device, fence, nullptr); }
+            if (pool) { vkDestroyCommandPool(device, pool, nullptr); }
+            vkDestroyDevice(device, nullptr);
+        }
+        if (instance) { vkDestroyInstance(instance, nullptr); }
+    }
+};
+
+namespace
+{
+vkdnnStatus_t resultStatus(VkResult result)
+{
+    switch (result)
+    {
+    case VK_SUCCESS: return VKDNN_STATUS_SUCCESS;
+    case VK_ERROR_OUT_OF_HOST_MEMORY:
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return VKDNN_STATUS_OUT_OF_MEMORY;
+    case VK_ERROR_INCOMPATIBLE_DRIVER: return VKDNN_STATUS_NOT_SUPPORTED;
+    case VK_ERROR_DEVICE_LOST: return VKDNN_STATUS_DEVICE_LOST;
+    default: return VKDNN_STATUS_INTERNAL_ERROR;
+    }
+}
+
+vkdnnDeviceType_t deviceType(VkPhysicalDeviceType type)
+{
+    switch (type)
+    {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return VKDNN_DEVICE_TYPE_INTEGRATED_GPU;
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return VKDNN_DEVICE_TYPE_DISCRETE_GPU;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return VKDNN_DEVICE_TYPE_VIRTUAL_GPU;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: return VKDNN_DEVICE_TYPE_CPU;
+    default: return VKDNN_DEVICE_TYPE_OTHER;
+    }
+}
+
+struct DeviceRegistry
+{
+    VkInstance instance = VK_NULL_HANDLE;
+    std::vector<vkdnnDeviceProp> devices;
+    std::vector<std::array<uint8_t, VK_UUID_SIZE>> uuids;
+    std::mutex mutex;
+    bool initialized = false;
+
+    void reset()
+    {
+        if (instance) { vkDestroyInstance(instance, nullptr); }
+        instance = VK_NULL_HANDLE;
+    }
+
+    vkdnnStatus_t initialize()
+    {
+        if (initialized) { return VKDNN_STATUS_SUCCESS; }
+        reset();
+        // Release Vulkan before returning, never from DLL process-detach cleanup.
+        struct Cleanup
+        {
+            DeviceRegistry& state;
+            ~Cleanup() { state.reset(); }
+        } cleanup{ *this };
+        VkApplicationInfo app{};
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        app.pApplicationName = "vkdnn";
+        app.apiVersion = VK_API_VERSION_1_2;
+        VkInstanceCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        info.pApplicationInfo = &app;
+        VkResult result = vkCreateInstance(&info, nullptr, &instance);
+        if (result != VK_SUCCESS) { return resultStatus(result); }
+
+        std::vector<VkPhysicalDevice> physicalDevices;
+        // Bound retries so a changing driver inventory cannot block indefinitely.
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            uint32_t count = 0;
+            result = vkEnumeratePhysicalDevices(instance, &count, nullptr);
+            if (result != VK_SUCCESS) { return resultStatus(result); }
+            physicalDevices.resize(count);
+            if (count == 0) { break; }
+            result = vkEnumeratePhysicalDevices(instance, &count, physicalDevices.data());
+            if (result == VK_INCOMPLETE) { continue; }
+            if (result != VK_SUCCESS) { return resultStatus(result); }
+            physicalDevices.resize(count);
+            break;
+        }
+        if (result == VK_INCOMPLETE) { return VKDNN_STATUS_INTERNAL_ERROR; }
+
+        std::vector<vkdnnDeviceProp> discovered;
+        std::vector<std::array<uint8_t, VK_UUID_SIZE>> discoveredUuids;
+        for (VkPhysicalDevice device : physicalDevices)
+        {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(device, &properties);
+            if (properties.apiVersion < VK_API_VERSION_1_2) { continue; }
+            uint32_t count = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(device, &count, nullptr);
+            std::vector<VkQueueFamilyProperties> queues(count);
+            if (count == 0) { continue; }
+            vkGetPhysicalDeviceQueueFamilyProperties(device, &count, queues.data());
+            bool compute = false;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                if (queues[i].queueCount > 0 && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                {
+                    compute = true;
+                    break;
+                }
+            }
+            if (!compute) { continue; }
+
+            VkPhysicalDeviceMemoryProperties memory{};
+            vkGetPhysicalDeviceMemoryProperties(device, &memory);
+            vkdnnDeviceProp output{};
+            std::memcpy(output.name, properties.deviceName, sizeof(output.name));
+            output.name[sizeof(output.name) - 1] = '\0';
+            output.vendorId = properties.vendorID;
+            output.deviceId = properties.deviceID;
+            output.deviceType = deviceType(properties.deviceType);
+            output.apiVersion = properties.apiVersion;
+            output.driverVersion = properties.driverVersion;
+            for (uint32_t i = 0; i < memory.memoryHeapCount; ++i)
+            {
+                if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                {
+                    if (memory.memoryHeaps[i].size > std::numeric_limits<uint64_t>::max() - output.totalGlobalMem)
+                    {
+                        return VKDNN_STATUS_INTERNAL_ERROR;
+                    }
+                    output.totalGlobalMem += memory.memoryHeaps[i].size;
+                }
+            }
+            output.maxStorageBufferRange = properties.limits.maxStorageBufferRange;
+            output.maxComputeSharedMemorySize = properties.limits.maxComputeSharedMemorySize;
+            output.maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
+            for (int i = 0; i < 3; ++i)
+            {
+                output.maxComputeWorkGroupSize[i] = properties.limits.maxComputeWorkGroupSize[i];
+                output.maxComputeWorkGroupCount[i] = properties.limits.maxComputeWorkGroupCount[i];
+            }
+            discovered.push_back(output);
+            VkPhysicalDeviceIDProperties id{};
+            id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 extended{};
+            extended.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            extended.pNext = &id;
+            vkGetPhysicalDeviceProperties2(device, &extended);
+            std::array<uint8_t, VK_UUID_SIZE> uuid{};
+            std::memcpy(uuid.data(), id.deviceUUID, uuid.size());
+            discoveredUuids.push_back(uuid);
+        }
+        if (discovered.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return VKDNN_STATUS_INTERNAL_ERROR;
+        }
+        devices = std::move(discovered);
+        uuids = std::move(discoveredUuids);
+        initialized = true;
+        return VKDNN_STATUS_SUCCESS;
+    }
+};
+
+DeviceRegistry& registry()
+{
+    static DeviceRegistry value;
+    return value;
+}
+
+void releaseBuffer(vkdnnHandle_t handle, vkdnnMemory& memory)
+{
+    if (memory.buffer) { vkDestroyBuffer(handle->device, memory.buffer, nullptr); }
+    if (memory.allocation) { vkFreeMemory(handle->device, memory.allocation, nullptr); }
+    memory = {};
+}
+
+vkdnnStatus_t allocateBuffer(vkdnnHandle_t handle, VkDeviceSize bytes,
+    VkMemoryPropertyFlags flags, vkdnnMemory& memory)
+{
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = bytes;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { info.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT; }
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = vkCreateBuffer(handle->device, &info, nullptr, &memory.buffer);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(handle->device, memory.buffer, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(handle->physical, &properties);
+    uint32_t type = properties.memoryTypeCount;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
+    {
+        if ((requirements.memoryTypeBits & (1u << i))
+            && (properties.memoryTypes[i].propertyFlags & flags) == flags)
+        {
+            type = i;
+            break;
+        }
+    }
+    if (type == properties.memoryTypeCount)
+    {
+        releaseBuffer(handle, memory);
+        return VKDNN_STATUS_NOT_SUPPORTED;
+    }
+    VkMemoryAllocateInfo allocation{};
+    allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = type;
+    result = vkAllocateMemory(handle->device, &allocation, nullptr, &memory.allocation);
+    if (result == VK_SUCCESS) { result = vkBindBufferMemory(handle->device, memory.buffer, memory.allocation, 0); }
+    if (result != VK_SUCCESS)
+    {
+        releaseBuffer(handle, memory);
+        return resultStatus(result);
+    }
+    memory.size = bytes;
+    memory.capacity = requirements.size;
+    return VKDNN_STATUS_SUCCESS;
+}
+
+bool validRange(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset, size_t bytes)
+{
+    return handle && memory && handle->allocations.count(memory)
+        && offset <= memory->size && bytes <= memory->size - offset;
+}
+
+vkdnnStatus_t copyBuffer(vkdnnHandle_t handle, VkBuffer dst, VkDeviceSize dstOffset,
+    VkBuffer src, VkDeviceSize srcOffset, VkDeviceSize bytes)
+{
+    VkResult result = vkResetCommandPool(handle->device, handle->pool, 0);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(handle->command, &begin);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(handle->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    VkBufferCopy region{ srcOffset, dstOffset, bytes };
+    vkCmdCopyBuffer(handle->command, src, dst, 1, &region);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(handle->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    result = vkEndCommandBuffer(handle->command);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    result = vkResetFences(handle->device, 1, &handle->fence);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &handle->command;
+    result = vkQueueSubmit(handle->queue, 1, &submit, handle->fence);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    return resultStatus(vkWaitForFences(handle->device, 1, &handle->fence, VK_TRUE, UINT64_MAX));
+}
+
+// A padded staging range preserves neighboring bytes for unaligned transfers.
+vkdnnStatus_t transfer(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset,
+    void* host, size_t bytes, bool upload)
+{
+    if (!bytes) { return VKDNN_STATUS_SUCCESS; }
+    VkDeviceSize start = offset & ~VkDeviceSize(3);
+    VkDeviceSize end = (offset + bytes + VkDeviceSize(3)) & ~VkDeviceSize(3);
+    vkdnnMemory staging;
+    vkdnnStatus_t status = allocateBuffer(handle, end - start, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, staging);
+    if (status != VKDNN_STATUS_SUCCESS) { return status; }
+    struct Cleanup
+    {
+        vkdnnHandle_t handle;
+        vkdnnMemory& memory;
+        ~Cleanup() { releaseBuffer(handle, memory); }
+    } cleanup{ handle, staging };
+    if (!upload || start != offset || end != offset + bytes)
+    {
+        status = copyBuffer(handle, staging.buffer, 0, memory->buffer, start, end - start);
+        if (status != VKDNN_STATUS_SUCCESS) { return status; }
+    }
+    void* mapped = nullptr;
+    VkResult result = vkMapMemory(handle->device, staging.allocation, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    VkMappedMemoryRange range{};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = staging.allocation;
+    range.size = VK_WHOLE_SIZE;
+    result = vkInvalidateMappedMemoryRanges(handle->device, 1, &range);
+    if (result == VK_SUCCESS)
+    {
+        auto* data = static_cast<unsigned char*>(mapped) + (offset - start);
+        if (upload)
+        {
+            std::memcpy(data, host, bytes);
+            result = vkFlushMappedMemoryRanges(handle->device, 1, &range);
+        }
+        else
+        {
+            std::memcpy(host, data, bytes);
+        }
+    }
+    vkUnmapMemory(handle->device, staging.allocation);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    if (upload) { return copyBuffer(handle, memory->buffer, start, staging.buffer, 0, end - start); }
+    return VKDNN_STATUS_SUCCESS;
+}
+}    //namespace
+
+const char* vkdnnGetErrorString(vkdnnStatus_t status)
+{
+    switch (status)
+    {
+    case VKDNN_STATUS_SUCCESS: return "Success";
+    case VKDNN_STATUS_NOT_IMPLEMENTED: return "Not implemented";
+    case VKDNN_STATUS_INVALID_VALUE: return "Invalid value";
+    case VKDNN_STATUS_NO_DEVICE: return "No device";
+    case VKDNN_STATUS_NOT_SUPPORTED: return "Not supported";
+    case VKDNN_STATUS_OUT_OF_MEMORY: return "Out of memory";
+    case VKDNN_STATUS_DEVICE_LOST: return "Device lost";
+    case VKDNN_STATUS_INTERNAL_ERROR: return "Internal error";
+    case vkdnnErrorInitializationError: return "Initialization error";
+    case vkdnnErrorInvalidDevice: return "Invalid device";
+    case vkdnnErrorInvalidMemcpyDirection: return "Invalid memcpy direction";
+    default: return "Unknown status";
+    }
+}
+
+vkdnnStatus_t vkdnnGetDeviceCount(int* count)
+{
+    if (!count) { return VKDNN_STATUS_INVALID_VALUE; }
+    try
+    {
+        auto& state = registry();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        vkdnnStatus_t status = state.initialize();
+        if (status != VKDNN_STATUS_SUCCESS) { return status; }
+        *count = static_cast<int>(state.devices.size());
+        return VKDNN_STATUS_SUCCESS;
+    } catch (const std::bad_alloc&)
+    {
+        return VKDNN_STATUS_OUT_OF_MEMORY;
+    } catch (const std::system_error&)
+    {
+        return VKDNN_STATUS_INTERNAL_ERROR;
+    }
+}
+
+vkdnnStatus_t vkdnnGetDeviceProperties(vkdnnDeviceProp* properties, int device)
+{
+    if (!properties) { return VKDNN_STATUS_INVALID_VALUE; }
+    if (device < 0) { return vkdnnErrorInvalidDevice; }
+    try
+    {
+        auto& state = registry();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        vkdnnStatus_t status = state.initialize();
+        if (status != VKDNN_STATUS_SUCCESS) { return status; }
+        if (static_cast<size_t>(device) >= state.devices.size()) { return vkdnnErrorInvalidDevice; }
+        *properties = state.devices[device];
+        return VKDNN_STATUS_SUCCESS;
+    } catch (const std::bad_alloc&)
+    {
+        return VKDNN_STATUS_OUT_OF_MEMORY;
+    } catch (const std::system_error&)
+    {
+        return VKDNN_STATUS_INTERNAL_ERROR;
+    }
+}
+
+vkdnnStatus_t createContext(vkdnnHandle_t* handle, int device)
+{
+    if (!handle || device < 0) { return VKDNN_STATUS_INVALID_VALUE; }
+    try
+    {
+        std::array<uint8_t, VK_UUID_SIZE> uuid;
+        {
+            auto& state = registry();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            auto status = state.initialize();
+            if (status != VKDNN_STATUS_SUCCESS) { return status; }
+            if (static_cast<size_t>(device) >= state.devices.size()) { return VKDNN_STATUS_INVALID_VALUE; }
+            uuid = state.uuids[device];
+        }
+        auto context = std::make_unique<vkdnnContext>();
+        VkApplicationInfo app{};
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        app.apiVersion = VK_API_VERSION_1_2;
+        VkInstanceCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        info.pApplicationInfo = &app;
+        VkResult result = vkCreateInstance(&info, nullptr, &context->instance);
+        if (result != VK_SUCCESS) { return resultStatus(result); }
+        std::vector<VkPhysicalDevice> physical;
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            uint32_t count = 0;
+            result = vkEnumeratePhysicalDevices(context->instance, &count, nullptr);
+            if (result != VK_SUCCESS) { return resultStatus(result); }
+            physical.resize(count);
+            if (!count) { break; }
+            result = vkEnumeratePhysicalDevices(context->instance, &count, physical.data());
+            if (result == VK_INCOMPLETE) { continue; }
+            if (result != VK_SUCCESS) { return resultStatus(result); }
+            physical.resize(count);
+            break;
+        }
+        if (result == VK_INCOMPLETE) { return VKDNN_STATUS_INTERNAL_ERROR; }
+        for (auto candidate : physical)
+        {
+            VkPhysicalDeviceIDProperties id{};
+            id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 properties{};
+            properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            properties.pNext = &id;
+            vkGetPhysicalDeviceProperties2(candidate, &properties);
+            if (std::memcmp(id.deviceUUID, uuid.data(), uuid.size()) == 0)
+            {
+                context->physical = candidate;
+                break;
+            }
+        }
+        if (!context->physical) { return VKDNN_STATUS_NO_DEVICE; }
+        uint32_t count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(context->physical, &count, nullptr);
+        std::vector<VkQueueFamilyProperties> queues(count);
+        vkGetPhysicalDeviceQueueFamilyProperties(context->physical, &count, queues.data());
+        uint32_t family = count;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (queues[i].queueCount && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
+            {
+                family = i;
+                break;
+            }
+        }
+        if (family == count) { return VKDNN_STATUS_NOT_SUPPORTED; }
+        float priority = 1.0f;
+        VkDeviceQueueCreateInfo queueInfo{};
+        queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueInfo.queueFamilyIndex = family;
+        queueInfo.queueCount = 1;
+        queueInfo.pQueuePriorities = &priority;
+        VkDeviceCreateInfo deviceInfo{};
+        deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        deviceInfo.queueCreateInfoCount = 1;
+        deviceInfo.pQueueCreateInfos = &queueInfo;
+        result = vkCreateDevice(context->physical, &deviceInfo, nullptr, &context->device);
+        if (result != VK_SUCCESS) { return resultStatus(result); }
+        vkGetDeviceQueue(context->device, family, 0, &context->queue);
+        VkCommandPoolCreateInfo pool{};
+        pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool.queueFamilyIndex = family;
+        result = vkCreateCommandPool(context->device, &pool, nullptr, &context->pool);
+        if (result != VK_SUCCESS) { return resultStatus(result); }
+        VkCommandBufferAllocateInfo command{};
+        command.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        command.commandPool = context->pool;
+        command.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        command.commandBufferCount = 1;
+        result = vkAllocateCommandBuffers(context->device, &command, &context->command);
+        if (result != VK_SUCCESS) { return resultStatus(result); }
+        VkFenceCreateInfo fence{};
+        fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        result = vkCreateFence(context->device, &fence, nullptr, &context->fence);
+        if (result != VK_SUCCESS) { return resultStatus(result); }
+        context->index = device;
+        *handle = context.release();
+        return VKDNN_STATUS_SUCCESS;
+    } catch (const std::bad_alloc&) { return VKDNN_STATUS_OUT_OF_MEMORY; } catch (const std::system_error&)
+    {
+        return VKDNN_STATUS_INTERNAL_ERROR;
+    }
+}
+
+vkdnnStatus_t destroyContext(vkdnnHandle_t handle)
+{
+    if (!handle || !handle->allocations.empty()) { return VKDNN_STATUS_INVALID_VALUE; }
+    auto status = resultStatus(vkDeviceWaitIdle(handle->device));
+    if (status != VKDNN_STATUS_SUCCESS && status != VKDNN_STATUS_DEVICE_LOST) { return status; }
+    delete handle;
+    return status;
+}
+
+vkdnnStatus_t synchronizeContext(vkdnnHandle_t handle)
+{
+    if (!handle) { return VKDNN_STATUS_INVALID_VALUE; }
+    return resultStatus(vkDeviceWaitIdle(handle->device));
+}
+
+vkdnnStatus_t allocateMemory(vkdnnHandle_t handle, vkdnnMemory_t* memory, size_t bytes)
+{
+    if (!handle || !memory || !bytes || bytes > std::numeric_limits<size_t>::max() - 3)
+    {
+        return VKDNN_STATUS_INVALID_VALUE;
+    }
+    try
+    {
+        auto allocation = std::make_unique<vkdnnMemory>();
+        auto status = allocateBuffer(handle, (bytes + 3) & ~VkDeviceSize(3), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, *allocation);
+        if (status != VKDNN_STATUS_SUCCESS) { return status; }
+        allocation->size = bytes;
+        try
+        {
+            handle->allocations.insert(allocation.get());
+        } catch (const std::bad_alloc&)
+        {
+            releaseBuffer(handle, *allocation);
+            return VKDNN_STATUS_OUT_OF_MEMORY;
+        }
+        *memory = allocation.release();
+        return VKDNN_STATUS_SUCCESS;
+    } catch (const std::bad_alloc&) { return VKDNN_STATUS_OUT_OF_MEMORY; }
+}
+
+vkdnnStatus_t freeMemory(vkdnnHandle_t handle, vkdnnMemory_t memory)
+{
+    if (!handle || !memory || !handle->allocations.count(memory)) { return VKDNN_STATUS_INVALID_VALUE; }
+    releaseBuffer(handle, *memory);
+    handle->allocations.erase(memory);
+    delete memory;
+    return VKDNN_STATUS_SUCCESS;
+}
+
+vkdnnStatus_t copyHtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t offset, const void* src, size_t bytes)
+{
+    if (!src || !validRange(handle, dst, offset, bytes)) { return VKDNN_STATUS_INVALID_VALUE; }
+    return transfer(handle, dst, offset, const_cast<void*>(src), bytes, true);
+}
+
+vkdnnStatus_t copyDtoH(vkdnnHandle_t handle, void* dst, vkdnnMemory_t src, size_t offset, size_t bytes)
+{
+    if (!dst || !validRange(handle, src, offset, bytes)) { return VKDNN_STATUS_INVALID_VALUE; }
+    return transfer(handle, src, offset, dst, bytes, false);
+}
+
+vkdnnStatus_t copyDtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t dstOffset, vkdnnMemory_t src, size_t srcOffset, size_t bytes)
+{
+    if (!validRange(handle, dst, dstOffset, bytes) || !validRange(handle, src, srcOffset, bytes))
+    {
+        return VKDNN_STATUS_INVALID_VALUE;
+    }
+    if (dst == src && bytes && dstOffset < srcOffset + bytes && srcOffset < dstOffset + bytes)
+    {
+        return VKDNN_STATUS_INVALID_VALUE;
+    }
+    if (!bytes) { return VKDNN_STATUS_SUCCESS; }
+    if ((dstOffset | srcOffset | bytes) % 4 == 0)
+    {
+        return copyBuffer(handle, dst->buffer, dstOffset, src->buffer, srcOffset, bytes);
+    }
+    try
+    {
+        std::vector<unsigned char> host(bytes);
+        auto status = transfer(handle, src, srcOffset, host.data(), bytes, false);
+        if (status != VKDNN_STATUS_SUCCESS) { return status; }
+        return transfer(handle, dst, dstOffset, host.data(), bytes, true);
+    } catch (const std::bad_alloc&) { return VKDNN_STATUS_OUT_OF_MEMORY; }
+}
+
+vkdnnStatus_t setMemory(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset, int value, size_t bytes)
+{
+    if (!validRange(handle, memory, offset, bytes)) { return VKDNN_STATUS_INVALID_VALUE; }
+    if (!bytes) { return VKDNN_STATUS_SUCCESS; }
+    try
+    {
+        std::vector<unsigned char> host(bytes, static_cast<unsigned char>(value));
+        return transfer(handle, memory, offset, host.data(), bytes, true);
+    } catch (const std::bad_alloc&) { return VKDNN_STATUS_OUT_OF_MEMORY; }
+}
