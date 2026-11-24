@@ -20,8 +20,15 @@ set_target_properties(vkdnn_device_query_test PROPERTIES
 add_test(NAME vkdnn.device_query COMMAND vkdnn_device_query_test)
 set_tests_properties(vkdnn.device_query PROPERTIES SKIP_RETURN_CODE 77)
 
+add_executable(vkdnn_cnn_stub_test cnn_stub_test.c)
+target_link_libraries(vkdnn_cnn_stub_test PRIVATE vkdnn)
+set_target_properties(vkdnn_cnn_stub_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF LINKER_LANGUAGE CXX
+)
+add_test(NAME vkdnn.cnn_stub COMMAND vkdnn_cnn_stub_test)
+
 if(WIN32)
-    set_target_properties(vkdnn_memory_test vkdnn_device_query_test PROPERTIES
+    set_target_properties(vkdnn_memory_test vkdnn_device_query_test vkdnn_cnn_stub_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
 endif()

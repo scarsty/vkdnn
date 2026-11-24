@@ -92,7 +92,7 @@ vkdnn/
 **交付物**
 
 - 实现矩阵运算 $C = \alpha\,\operatorname{op}(A)\operatorname{op}(B) + \beta C$。
-- 首版采用 row-major，支持 A/B 转置及合法 leading dimension；明确 M/N/K 为零时的行为。
+- 首版采用 cuBLAS 风格列主序，支持 A/B 转置及合法 leading dimension；明确 M/N/K 为零时的行为。
 - 先提供简单通用 kernel 和 CPU 参考，再实现使用 shared memory 的 tiled kernel。
 - 为 alpha/beta 为零的情况定义访问语义，特别是 beta 为零时不读取旧 C。
 - 建立 GEMM benchmark，覆盖小矩阵、方阵、长宽比差异和非 tile 对齐尺寸。

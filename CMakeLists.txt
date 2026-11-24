@@ -7,7 +7,7 @@ endif()
 
 find_package(Vulkan REQUIRED)
 
-add_library(vkdnn SHARED src/core/vkdnn.cpp src/core/runtime.cpp)
+add_library(vkdnn SHARED src/core/vkdnn.cpp src/core/runtime.cpp src/ops/cnn_stubs.cpp)
 target_compile_definitions(vkdnn PRIVATE VKDNN_BUILDING_LIBRARY)
 target_link_libraries(vkdnn PRIVATE Vulkan::Vulkan)
 target_include_directories(vkdnn PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")

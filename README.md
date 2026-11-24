@@ -15,6 +15,8 @@
 
 ## 能力路线
 
+基本 CNN 的前向/反向算子与参考接口见 [CNN 算子清单](docs/CNN_OPERATORS.md)。当前已增加 [DNN 头文件](include/vkdnn/vkdnn_ops.h) 和 [BLAS 头文件](include/vkdnn/vkblas.h)，这些新增接口全部为返回 `NOT_SUPPORTED` 的桩，不代表已有 CNN 计算能力。
+
 以下均为规划内容，具体支持范围以未来发布版本为准。
 
 | 层级 | 初期目标 | 后续扩展 |

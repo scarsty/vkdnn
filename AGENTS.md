@@ -14,6 +14,8 @@
 
 ## 已确认决策
 
+- BLAS 层用 `vkblas` 前缀，DNN 层用 `vkdnn` 前缀；基础 CNN 接口与桩状态见 [docs/CNN_OPERATORS.md](docs/CNN_OPERATORS.md)。BLAS 使用 cuBLAS 风格列主序 GEMM，不沿用早期 row-major 草案。
+
 - 基础运行时接口已参考本机 CUDA 13.2，由显式上下文与分方向复制接口调整为 CUDA Runtime 风格；后续工作不得无故退回旧形式。
 - 工程构建为动态库，直接链接 Vulkan 加载器；Windows 运行时依赖 `vulkan-1.dll`，不使用手动加载作为默认路径。
 - 当前采用同步复制；非对齐设备复制与 memset 可暂经 staging 路径实现，其性能限制需如实保留在文档中。

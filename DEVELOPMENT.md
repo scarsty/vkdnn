@@ -16,7 +16,7 @@
 2. 基础运行时使用 `vkdnnError_t` 返回状态，成功为 `vkdnnSuccess`，错误使用 `vkdnnError...` 命名；复制方向使用 `vkdnnMemcpyKind`，不另建按方向拆分的公开复制函数。
 3. 保持 CUDA 风格的 `vkdnnMalloc(void**, size_t)`、`vkdnnFree(void*)`、`vkdnnMemcpy(void*, const void*, size_t, enum vkdnnMemcpyKind)`、`vkdnnMemset(void*, int, size_t)`。不向这些接口增加 Vulkan 对象、显式上下文或独立 offset 参数。
 4. 运行时以当前设备与隐式上下文管理资源；矩阵和 DNN 层按各自参考库使用显式计算句柄/描述符，不将运行时的隐式风格强套到所有模块。
-5. 矩阵和 DNN 层的具体符号前缀、类型名在引入该层时统一确定，避免不同参考库替换前缀后产生同名接口冲突；不可为解决冲突随意改变单个接口风格。
+5. 矩阵层统一使用 `vkblas` / `VKBLAS_` 前缀和 `vkblasStatus_t`，DNN 层使用 `vkdnn` / `VKDNN_` 前缀和 `vkdnnStatus_t`；运行时保留 `vkdnnError_t`。三个状态类型不能混用，运行时错误字符串函数不接收 DNN/BLAS 状态。
 6. 公开头文件保持 C 兼容并提供 C ABI，C++ 类型与 Vulkan 实现细节留在内部。资源所有权、线程安全、同步和错误语义必须有明确契约。
 
 ### 参考依据与兼容边界
