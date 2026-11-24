@@ -2,12 +2,12 @@
 
 ## 范围和状态
 
-目标是先支持类似 LeNet 的链式二维分类 CNN：卷积 → 偏置 → 激活 → 池化 → 全连接 → Softmax，同时预留这些算子的反向接口。目前实现 FP32 SGEMM、直接卷积、AddTensor、ReLU/Sigmoid/tanh、Pooling、Softmax 的真实 Vulkan 计算及相应描述符；全部专用反向仍为桩，尚无完整网络示例、预训练参数或训练能力。
+目标是先支持类似 LeNet 的链式二维分类 CNN：卷积 → 偏置 → 激活 → 池化 → 全连接 → Softmax，同时预留这些算子的反向接口。目前实现 FP32 SGEMM、直接卷积、AddTensor、ReLU/Sigmoid/tanh、Pooling、Softmax 的真实 Vulkan 计算及相应描述符；专用反向仅 ReLU/Sigmoid/tanh 激活反向已实现，其余仍为桩，尚无完整网络示例、预训练参数或训练能力。
 
 - DNN 接口见 [vkdnn_ops.h](../include/vkdnn/vkdnn_ops.h)，使用 `vkdnn` 前缀与独立的 `vkdnnStatus_t`。
 - BLAS 接口见 [vkblas.h](../include/vkdnn/vkblas.h)，使用 `vkblas` 前缀与 `vkblasStatus_t`，避免 Create/Destroy/Handle 与 DNN 层冲突。
 - 底层设备与内存仍由 [vkdnn.h](../include/vkdnn/vkdnn.h) 的 CUDA Runtime 风格接口提供，返回 `vkdnnError_t`。
-- 剩余桩（全部专用反向）返回对应层 `NOT_SUPPORTED`，不检查参数、不修改输出、不分配资源、不执行 GPU 工作。
+- 剩余桩（卷积输入/权重/bias、池化、Softmax 专用反向）返回对应层 `NOT_SUPPORTED`，不检查参数、不修改输出、不分配资源、不执行 GPU 工作。
 - 初步面向 FP32、二维张量/卷积。枚举只是参考接口子集，声明 DOUBLE/HALF、算法或布局并不代表支持。
 
 ## 最小前向算子集
@@ -55,12 +55,23 @@
 - 算法参考：2026-11-24 阅读上游 [ncnn convolution Vulkan](https://github.com/Tencent/ncnn/blob/master/src/layer/vulkan/convolution_vulkan.cpp) 的有效核/stride/padding 与路径组织、[sigmoid shader](https://github.com/Tencent/ncnn/blob/master/src/layer/vulkan/shader/sigmoid.comp) 的指数激活思路；未复制、编译其源码或使用其内部类型/宏。签名核对本机 CUDA 13.2 所附 cuDNN 9.14 `cudnn_cnn.h`/`cudnn_ops.h`；不是 ABI 兼容实现。
 - 2026-11-24 Windows / NVIDIA GeForce RTX 5090：Debug、Release 六项 CTest（runtime memory、device query、CNN stub、CNN forward/Sigmoid、GEMM、convolution）全部通过。启用 `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`、`VK_LAYER_VALIDATE_SYNC=1`、`VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`，无 validation/synchronization 错误；loader 日志确认 Khronos validation DLL 实际加载。单 GPU，跨设备测试明确跳过。IDE CMake build/CTest 无法配置（诊断为空），使用 CLI 构建与 CTest。C/C++ 及 `.comp` 按指定规则格式化并通过 dry-run/Werror；新增卷积/描述符与激活 C 符号已核对 DLL exports。未做跨厂商或性能验证。
 
+### 激活反向
+
+- `vkdnnActivationBackward(handle, activationDesc, alpha, yDesc, y, dyDesc, dy, xDesc, x, beta, dxDesc, dx)` 参数顺序已核对本机 CUDA 13.2 所附 cuDNN 9.14 `cudnn_ops.h`；语义参照 NVIDIA [ActivationBackward 文档](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-ops-library.html#cudnnactivationbackward)。传统描述符接口在 cuDNN 9.0 起 deprecated，并非 backend graph API。
+- 同步 GPU 执行 `dx = alpha * (dy * derivative) + beta * dx`。仅支持同形 FP32 连续 NCHW、正维度及 batch；继承 tensor 元素数、32 位索引、storage buffer、dispatch/push constant 上限。独立原创 `backward.comp`，复用运行时分配/锁、四 buffer dispatch、barrier/fence，无 CPU 算子实现或 ncnn 源码依赖。
+- ReLU 使用原始 x：x>0 导数为 1，否则为 0，包括 +0/-0（明确采用零点导数 0）。Sigmoid 使用 `y*(1-y)`，tanh 使用 `1-y*y`，y 必须是**未作 alpha/beta 缩放的激活输出**；不能把混合旧输出后的前向结果直接传入，也不自动反算缩放。调用方负责 x/y 对应关系，库不验证数值一致性。Sigmoid/tanh 不读取 x 的值，ReLU 不读取 y 的值，但 alpha 非零时仍校验全部 x/y/dy 地址。
+- ReLU 的 x 为 NaN 时，PROPAGATE_NAN 产生 NaN；NOT_PROPAGATE_NAN 将其导数视为零。Sigmoid/tanh 的 y 为 NaN 始终传播（与当前前向一致）；dy 为 NaN、NaN scalar、beta 非零时旧 dx 为 NaN 均传播。未用于导数的输入值不影响结果。其余 Inf/零乘 Inf 等按 FP32 算术，包括零导数乘无穷 dy 可产生 NaN；不屏蔽上游梯度的异常值。
+- alpha/beta 为宿主 float；alpha=0 不读取也不校验 x/y/dy 地址，可为 NULL 或与 dx 重叠，但仍校验全部描述符及形状；beta=0 不读旧 dx，二者均零写零。输出始终须有效。实际输入必须容量足够、4 字节对齐、本设备登记分配；允许输入互相别名和同分配非重叠范围，拒绝任意实际输入与 dx 重叠（含原地）。这是有意沿用本库前向的更严格限制，**不同于 cuDNN 允许 dy==dx**，不宣称完整语义兼容。
+- 句柄固定创建设备、当前设备一致、指针 free/reset 生命周期、描述符注册/初始化/失败 setter 保留规则与前向一致；参数/能力检查失败不写输出。DeviceReset 后可用原句柄和新分配继续计算。
+- `tests/activation_backward_test.cpp` 使用 CPU 参考及实际 GPU 前向目标的小规模中心有限差分（避开 ReLU 零点），覆盖三种激活、随机、多 batch、1/63/64/65/256 元素、alpha/beta、NaN/Inf、零点、offset、容量/对齐/重叠、描述符与生命周期。跨设备仅在多 GPU 时验证。
+- 2026-11-24 Windows / RTX 5090：CMake 生成的工程由 MSBuild 完成 Debug/Release 构建，两配置七个当前测试程序均直接执行通过；IDE CMake build/CTest 工具仍报无法配置、diagnostics 为空，故不宣称 IDE CTest 成功。启用 `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`、`VK_LAYER_VALIDATE_SYNC=1`，未见 validation/synchronization 错误，loader 日志确认 validation DLL 加载。初次同时设置旧 `VK_LAYER_ENABLES` 出现弃用设置警告，去掉旧设置后复验无警告。根原生 VS 解决方案 Debug/Release 构建通过（显式设置已安装的 Vulkan SDK 路径）；两配置 DLL 的 `vkdnnActivationBackward` C 导出已核对。修改 C/C++ 与 shader 均通过指定 clang-format 严格检查。单 GPU 跳过跨设备；未做跨厂商、性能或完整训练验证。
+
 ### LeNet 现在还缺什么
 
 - 经典 LeNet-5 常用 tanh/缩放 tanh；一些教学变体用 sigmoid，现代变体用 ReLU。Sigmoid/ReLU/tanh 已可用；缩放 tanh 可由调用方安排输入缩放及输出 alpha（尚无独立通用输入 scale 算子）。不将 sigmoid 冒充经典模型的等价替换。原版 C3 的非规则稀疏连接也不是普通 groups 的同义词，可由调用方构造带零权重的稠密核表达。
 - 最大和平均池化（含/不含 padding）已可用；原版可训练下采样的系数/偏置不等于普通平均池化，仍缺对应逐通道算术。FC 可通过列主序 `vkblasSgemm` 完成；连续 NCHW 每个样本 flatten 只需矩阵视图，不需要复制；布局转换/非连续重排尚无接口，须正确安排权重及 GEMM 转置/leading dimension。
 - 卷积、bias、sigmoid/ReLU/tanh、池化、FC、softmax 已有前向积木；网络示例、预训练参数、权重加载、图像归一化/尺寸处理、显存与布局衔接仍未实现。没有端到端模型准确率验证，不能将算子测试宣称为完整 LeNet 已跑通。
-- 训练仍缺卷积/激活/池化等专用反向、损失/初始梯度、优化器/参数更新与自动微分；完整训练仍未实现。
+- 激活反向已实现；训练仍缺卷积/池化/Softmax 等专用反向、损失/初始梯度、优化器/参数更新与自动微分；完整训练仍未实现。
 
 ### SGEMM 实现与限制
 
@@ -77,12 +88,12 @@ Flatten 对连续存储通常只是形状解释，不需要独立 GPU kernel；�
 
 ## 训练所需反向算子
 
-| 梯度 | 本轮桩接口 |
+| 梯度 | 接口与状态 |
 | --- | --- |
 | 卷积输入梯度 | `vkdnnConvolutionBackwardData`、对应 workspace 查询 |
 | 卷积权重梯度 | `vkdnnConvolutionBackwardFilter`、对应 workspace 查询 |
 | bias 梯度 | `vkdnnConvolutionBackwardBias` |
-| 激活输入梯度 | `vkdnnActivationBackward` |
+| 激活输入梯度 | `vkdnnActivationBackward` 已实现 ReLU/Sigmoid/tanh；其余专用反向仍为桩 |
 | 池化输入梯度 | `vkdnnPoolingBackward` |
 | Softmax 输入梯度 | `vkdnnSoftmaxBackward` |
 | 全连接输入/权重梯度 | 复用 `vkblasSgemm`，调整转置和维度 |

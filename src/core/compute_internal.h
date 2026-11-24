@@ -13,6 +13,14 @@ struct ComputeParams
 
 vkdnnError_t runtimeCompute(int device, const void* x, size_t xBytes, void* y, size_t yBytes, ComputeParams params);
 
+struct ActivationBackwardParams
+{
+    uint32_t count, mode, nan, xOffset, yOffset, dyOffset, dxOffset;
+    float alpha, beta;
+};
+vkdnnError_t runtimeActivationBackward(int device, const void* x, const void* y, const void* dy,
+    void* dx, size_t bytes, ActivationBackwardParams params);
+
 struct GemmParams
 {
     uint32_t m, n, k, lda, ldb, ldc, transa, transb;

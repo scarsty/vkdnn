@@ -172,6 +172,39 @@ vkdnnError_t runtimeCompute(int device, const void* x, size_t xBytes, void* y, s
         });
 }
 
+vkdnnError_t runtimeActivationBackward(int device, const void* x, const void* y, const void* dy,
+    void* dx, size_t bytes, ActivationBackwardParams params)
+{
+    return guarded([&](Runtime& state)
+        {
+            if (device != currentDevice) { return vkdnnErrorInvalidDevice; }
+            Pointer output = locate(state, dx);
+            if (!fits(output, bytes) || output.offset % 4) { return vkdnnErrorInvalidValue; }
+            if (output.allocation->device != device) { return vkdnnErrorInvalidDevice; }
+            if ((output.offset + bytes) / 4 > UINT32_MAX) { return vkdnnErrorNotSupported; }
+            const void* addresses[] = { x, y, dy };
+            Pointer inputs[] = { output, output, output };
+            if (params.alpha != 0)
+            {
+                for (int i = 0; i < 3; ++i)
+                {
+                    inputs[i] = locate(state, addresses[i]);
+                    if (!fits(inputs[i], bytes) || inputs[i].offset % 4) { return vkdnnErrorInvalidValue; }
+                    if (inputs[i].allocation->device != device) { return vkdnnErrorInvalidDevice; }
+                    if ((inputs[i].offset + bytes) / 4 > UINT32_MAX) { return vkdnnErrorNotSupported; }
+                    if (inputs[i].allocation == output.allocation && inputs[i].offset < output.offset + bytes
+                        && output.offset < inputs[i].offset + bytes) { return vkdnnErrorNotSupported; }
+                }
+            }
+            params.xOffset = static_cast<uint32_t>(inputs[0].offset / 4);
+            params.yOffset = static_cast<uint32_t>(inputs[1].offset / 4);
+            params.dyOffset = static_cast<uint32_t>(inputs[2].offset / 4);
+            params.dxOffset = static_cast<uint32_t>(output.offset / 4);
+            return activationBackwardBuffers(output.allocation->context, inputs[0].allocation->memory,
+                inputs[1].allocation->memory, inputs[2].allocation->memory, output.allocation->memory, params);
+        });
+}
+
 vkdnnError_t runtimeHostScalar(const float* pointer, float& value)
 {
     return guarded([&](Runtime& state)

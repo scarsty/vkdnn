@@ -16,6 +16,9 @@
 static const uint32_t forwardSpirv[] =
 #include "forward_spv.inc"
     ;
+static const uint32_t backwardSpirv[] =
+#include "backward_spv.inc"
+    ;
 static const uint32_t gemmSpirv[] =
 #include "gemm_spv.inc"
     ;
@@ -131,7 +134,7 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
     {
         return status(result);
     }
-    VkDescriptorSetLayoutBinding bindings[3]{};
+    VkDescriptorSetLayoutBinding bindings[4]{};
     for (uint32_t i = 0; i < bufferCount; ++i)
     {
         bindings[i].binding = i;
@@ -189,8 +192,8 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
     {
         return status(result);
     }
-    VkDescriptorBufferInfo buffers[3]{};
-    VkWriteDescriptorSet writes[3]{};
+    VkDescriptorBufferInfo buffers[4]{};
+    VkWriteDescriptorSet writes[4]{};
     for (uint32_t i = 0; i < bufferCount; ++i)
     {
         buffers[i] = { memory[i]->buffer, 0, memory[i]->size };
@@ -244,6 +247,13 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
         return status(result);
     }
     return status(vkWaitForFences(r.device, 1, &context->fence, VK_TRUE, UINT64_MAX));
+}
+
+vkdnnError_t vkdnnRuntime::activationBackwardBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t y,
+    vkdnnMemory_t dy, vkdnnMemory_t dx, const ActivationBackwardParams& params)
+{
+    vkdnnMemory_t buffers[] = { x, y, dy, dx };
+    return dispatchBuffers(context, buffers, 4, backwardSpirv, sizeof(backwardSpirv), &params, sizeof(params), (params.count + 63u) / 64u, 1);
 }
 
 vkdnnError_t vkdnnRuntime::computeBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t y, const ComputeParams& params)

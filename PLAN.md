@@ -12,6 +12,8 @@
 
 ## 2. 首期范围与约束
 
+激活反向已落地：FP32 连续 NCHW/batch 的 ReLU、Sigmoid、tanh，独立 Vulkan compute shader；CPU 参考及实际 GPU 前向目标有限差分验收见 `tests/activation_backward_test.cpp`。这是 M5 的第一项增量，其余卷积/bias、池化、Softmax 专用反向仍为桩；不代表训练闭环已完成。
+
 - 单设备、单计算队列，不引入多 GPU 或分布式通信。
 - 宿主实现采用 C++17，对外采用 C ABI，基础运行时形式向 CUDA Runtime 靠拢（当前设备、隐式上下文、void* 显存地址及复制方向枚举）；公开 API 在试验阶段允许调整，发布前再制定兼容策略。
 - 暂以 Vulkan 1.2 为基线；M0 核实目标设备与必要 feature/limit，M1 将要求固化为可查询、可诊断的契约。

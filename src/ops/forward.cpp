@@ -328,6 +328,30 @@ vkdnnStatus_t vkdnnActivationForward(vkdnnHandle_t handle, vkdnnActivationDescri
         });
 }
 
+vkdnnStatus_t vkdnnActivationBackward(vkdnnHandle_t handle, vkdnnActivationDescriptor_t a, const void* alpha,
+    vkdnnTensorDescriptor_t yd, const void* y, vkdnnTensorDescriptor_t dyd, const void* dy,
+    vkdnnTensorDescriptor_t xd, const void* x, const void* beta, vkdnnTensorDescriptor_t dxd, void* dx)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            if (!activations.count(a) || !a->initialized || !tensor(xd) || !tensor(yd) || !tensor(dyd)
+                || !tensor(dxd) || !equal(xd, yd) || !equal(xd, dyd) || !equal(xd, dxd))
+            {
+                return VKDNN_STATUS_BAD_PARAM;
+            }
+            ActivationBackwardParams p{};
+            auto s = runtimeHostScalar(static_cast<const float*>(alpha), p.alpha);
+            if (s != vkdnnSuccess) { return mapStatus(s); }
+            s = runtimeHostScalar(static_cast<const float*>(beta), p.beta);
+            if (s != vkdnnSuccess) { return mapStatus(s); }
+            p.count = xd->count;
+            p.mode = a->mode;
+            p.nan = a->nan;
+            return mapStatus(runtimeActivationBackward(handle->device, x, y, dy, dx, size_t(xd->count) * 4, p));
+        });
+}
+
 vkdnnStatus_t vkdnnAddTensor(vkdnnHandle_t handle, const void* alpha, vkdnnTensorDescriptor_t a,
     const void* x, const void* beta, vkdnnTensorDescriptor_t c, void* y)
 {

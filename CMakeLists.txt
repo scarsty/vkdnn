@@ -15,6 +15,11 @@ add_custom_command(OUTPUT "${FORWARD_SPV}"
     DEPENDS src/ops/forward.comp VERBATIM)
 
 set(GEMM_SPV "${CMAKE_CURRENT_BINARY_DIR}/generated/gemm_spv.inc")
+set(BACKWARD_SPV "${CMAKE_CURRENT_BINARY_DIR}/generated/backward_spv.inc")
+add_custom_command(OUTPUT "${BACKWARD_SPV}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${VKDNN_GLSLC}" --target-env=vulkan1.2 -mfmt=c "${CMAKE_CURRENT_SOURCE_DIR}/src/ops/backward.comp" -o "${BACKWARD_SPV}"
+    DEPENDS src/ops/backward.comp VERBATIM)
 add_custom_command(OUTPUT "${GEMM_SPV}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
     COMMAND "${VKDNN_GLSLC}" --target-env=vulkan1.2 -mfmt=c "${CMAKE_CURRENT_SOURCE_DIR}/src/ops/gemm.comp" -o "${GEMM_SPV}"
@@ -24,7 +29,7 @@ add_custom_command(OUTPUT "${CONVOLUTION_SPV}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
     COMMAND "${VKDNN_GLSLC}" --target-env=vulkan1.2 -mfmt=c "${CMAKE_CURRENT_SOURCE_DIR}/src/ops/convolution.comp" -o "${CONVOLUTION_SPV}"
     DEPENDS src/ops/convolution.comp VERBATIM)
-add_library(vkdnn SHARED src/core/vkdnn.cpp src/core/runtime.cpp src/ops/cnn_stubs.cpp src/ops/forward.cpp src/ops/gemm.cpp "${FORWARD_SPV}" "${GEMM_SPV}" "${CONVOLUTION_SPV}")
+add_library(vkdnn SHARED src/core/vkdnn.cpp src/core/runtime.cpp src/ops/cnn_stubs.cpp src/ops/forward.cpp src/ops/gemm.cpp "${FORWARD_SPV}" "${GEMM_SPV}" "${CONVOLUTION_SPV}" "${BACKWARD_SPV}")
 target_include_directories(vkdnn PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(vkdnn PRIVATE VKDNN_BUILDING_LIBRARY)
 target_link_libraries(vkdnn PRIVATE Vulkan::Vulkan)

@@ -29,7 +29,7 @@ int main(void)
     CHECK(vkdnnGetConvolutionBackwardFilterWorkspaceSize(handle, tensor, tensor, conv, filter, VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0, &workspace));
     CHECK(vkdnnConvolutionBackwardFilter(handle, &data, tensor, &data, tensor, &data, conv, VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0, &data, sizeof(data), &data, filter, &data));
     CHECK(vkdnnConvolutionBackwardBias(handle, &data, tensor, &data, &data, tensor, &data));
-    CHECK(vkdnnActivationBackward(handle, activation, &data, tensor, &data, tensor, &data, tensor, &data, &data, tensor, &data));
+    if (vkdnnActivationBackward(handle, activation, &data, tensor, &data, tensor, &data, tensor, &data, &data, tensor, &data) != VKDNN_STATUS_NOT_INITIALIZED) { return 1; }
     CHECK(vkdnnPoolingBackward(handle, pool, &data, tensor, &data, tensor, &data, tensor, &data, &data, tensor, &data));
     CHECK(vkdnnSoftmaxBackward(handle, VKDNN_SOFTMAX_ACCURATE, VKDNN_SOFTMAX_MODE_CHANNEL, &data, tensor, &data, tensor, &data, &data, tensor, &data));
     if (vkblasCreate(NULL) != VKBLAS_STATUS_INVALID_VALUE

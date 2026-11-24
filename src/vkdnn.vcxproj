@@ -56,15 +56,17 @@
     <None Include="ops\forward.comp" />
     <None Include="ops\gemm.comp" />
     <None Include="ops\convolution.comp" />
+    <None Include="ops\backward.comp" />
   </ItemGroup>
   <Target Name="ValidateVulkanSDK" BeforeTargets="PrepareForBuild">
     <Error Condition="!Exists('$(VULKAN_SDK)\Include\vulkan\vulkan.h')" Text="Set VULKAN_SDK to a Vulkan SDK directory containing Include\vulkan\vulkan.h." />
     <Error Condition="!Exists('$(VULKAN_SDK)\Bin\glslc.exe')" Text="VULKAN_SDK must contain Bin\glslc.exe." />
   </Target>
   <Target Name="CompileComputeShaders" BeforeTargets="ClCompile"
-          Inputs="$(MSBuildThisFileDirectory)ops\forward.comp;$(MSBuildThisFileDirectory)ops\gemm.comp;$(MSBuildThisFileDirectory)ops\convolution.comp"
-          Outputs="$(IntDir)generated\forward_spv.inc;$(IntDir)generated\gemm_spv.inc;$(IntDir)generated\convolution_spv.inc">
+          Inputs="$(MSBuildThisFileDirectory)ops\forward.comp;$(MSBuildThisFileDirectory)ops\gemm.comp;$(MSBuildThisFileDirectory)ops\convolution.comp;$(MSBuildThisFileDirectory)ops\backward.comp"
+          Outputs="$(IntDir)generated\forward_spv.inc;$(IntDir)generated\gemm_spv.inc;$(IntDir)generated\convolution_spv.inc;$(IntDir)generated\backward_spv.inc">
     <MakeDir Directories="$(IntDir)generated" />
+    <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\backward.comp&quot; -o &quot;$(IntDir)generated\backward_spv.inc&quot;" />
     <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\forward.comp&quot; -o &quot;$(IntDir)generated\forward_spv.inc&quot;" />
     <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\gemm.comp&quot; -o &quot;$(IntDir)generated\gemm_spv.inc&quot;" />
     <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\convolution.comp&quot; -o &quot;$(IntDir)generated\convolution_spv.inc&quot;" />

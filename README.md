@@ -2,7 +2,7 @@
 
 基于 Vulkan Compute 的深度学习计算基础库，目标是提供类似 cuBLAS 的矩阵计算能力与类似 cuDNN 的神经网络算子能力，为推理和训练框架提供跨 GPU 厂商的底层计算后端。
 
-> 已实现 Vulkan 1.2 运行时、FP32 列主序 tiled SGEMM，以及 FP32 连续 NCHW 的直接二维卷积（batch/groups/depthwise、padding/stride/dilation、卷积核翻转）、AddTensor 偏置/逐轴广播及残差加法、ReLU/Sigmoid/tanh、最大/平均池化、稳定 Softmax/LogSoftmax 真实 GPU 前向。卷积选择 `VKDNN_CONVOLUTION_FWD_ALGO_DIRECT`，workspace 为零；IMPLICIT_GEMM 保留但不支持。专用反向、网络示例、预训练参数与完整训练仍未实现，暂无性能数据。实现顺序和验收标准见 [开发计划](PLAN.md)。
+> 已实现 Vulkan 1.2 运行时、FP32 列主序 tiled SGEMM，以及 FP32 连续 NCHW 的直接二维卷积（batch/groups/depthwise、padding/stride/dilation、卷积核翻转）、AddTensor 偏置/逐轴广播及残差加法、ReLU/Sigmoid/tanh、最大/平均池化、稳定 Softmax/LogSoftmax 真实 GPU 前向，以及 ReLU/Sigmoid/tanh 激活反向。卷积选择 `VKDNN_CONVOLUTION_FWD_ALGO_DIRECT`，workspace 为零；IMPLICIT_GEMM 保留但不支持。其余专用反向、网络示例、预训练参数与完整训练仍未实现，暂无性能数据。实现顺序和验收标准见 [开发计划](PLAN.md)。
 
 ## 项目定位
 
@@ -15,7 +15,7 @@
 
 ## 能力路线
 
-基本 CNN 的前向/反向算子与参考接口见 [CNN 算子清单及 LeNet 缺口](docs/CNN_OPERATORS.md)。[DNN 头文件](include/vkdnn/vkdnn_ops.h) 中句柄、tensor/filter/convolution/activation/pooling 描述符及卷积、AddTensor、激活、池化、softmax 前向已实现，支持 batch、alpha/beta，确切 NaN/布局/别名限制见该文档；其余 DNN 仍返回 `NOT_SUPPORTED`。[BLAS](include/vkdnn/vkblas.h) 已实现同步 FP32 SGEMM、N/T/C、padded leading dimension 与宿主 alpha/beta；设备 scalar pointer mode 暂不支持。
+基本 CNN 的前向/反向算子与参考接口见 [CNN 算子清单及 LeNet 缺口](docs/CNN_OPERATORS.md)。[DNN 头文件](include/vkdnn/vkdnn_ops.h) 中句柄、tensor/filter/convolution/activation/pooling 描述符及卷积、AddTensor、激活、池化、softmax 前向和激活反向已实现，支持 batch、alpha/beta，确切 NaN/布局/别名限制见该文档；其余 DNN 仍返回 `NOT_SUPPORTED`。[BLAS](include/vkdnn/vkblas.h) 已实现同步 FP32 SGEMM、N/T/C、padded leading dimension 与宿主 alpha/beta；设备 scalar pointer mode 暂不支持。
 
 已在 [third_party/ncnn](third_party/ncnn/README.md) 保存固定版本参考快照，保留上游 BSD-3-Clause 许可；不参与构建。`src/ops/forward.comp` 和宿主调度为独立实现，构建期使用 Vulkan SDK `glslc` 生成嵌入式 SPIR-V，运行时无需 shader 文件或编译器。
 
@@ -61,7 +61,7 @@
 
 ### Visual Studio 原生工程
 
-直接打开根目录的 [vkdnn.sln](vkdnn.sln)，工程文件位于 [src/vkdnn.vcxproj](src/vkdnn.vcxproj)。支持 Debug/Release x64，当前工具集为 Visual Studio 2026 的 v145；需要安装 C++ 桌面开发工具、Windows SDK 和 Vulkan SDK，并设置 `VULKAN_SDK`。工程直接编译动态库和三个自有 compute shader，不依赖 CMake 生成工程，不编译 ncnn 参考代码。
+直接打开根目录的 [vkdnn.sln](vkdnn.sln)，工程文件位于 [src/vkdnn.vcxproj](src/vkdnn.vcxproj)。支持 Debug/Release x64，当前工具集为 Visual Studio 2026 的 v145；需要安装 C++ 桌面开发工具、Windows SDK 和 Vulkan SDK，并设置 `VULKAN_SDK`。工程直接编译动态库和四个自有 compute shader，不依赖 CMake 生成工程，不编译 ncnn 参考代码。
 
 输出位于 `build/vs/x64/Debug` 或 `build/vs/x64/Release`，包含 `vkdnn.dll` 和导入库 `vkdnn.lib`。原生解决方案目前仅包含库目标；完整测试继续使用下述 CMake 工程。新增源码或 shader 时须同步维护两套工程列表。
 

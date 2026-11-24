@@ -86,7 +86,8 @@ typedef enum vkdnnConvolutionBwdFilterAlgo_t
 } vkdnnConvolutionBwdFilterAlgo_t;
 
 /* Implemented: handle/tensor/filter/convolution/ReLU/sigmoid/tanh/pooling descriptors and their forward calls,
- * AddTensor broadcasting and ACCURATE/LOG softmax. FP32 contiguous NCHW only; see CNN_OPERATORS.md.
+ * AddTensor broadcasting, ACCURATE/LOG softmax and ReLU/sigmoid/tanh backward.
+ * FP32 contiguous NCHW only; see CNN_OPERATORS.md.
  * Other calls remain NOT_SUPPORTED stubs without output writes or GPU work. */
 VKDNN_API vkdnnStatus_t vkdnnCreate(vkdnnHandle_t* handle);
 VKDNN_API vkdnnStatus_t vkdnnDestroy(vkdnnHandle_t handle);
@@ -141,6 +142,11 @@ VKDNN_API vkdnnStatus_t vkdnnSetActivationDescriptor(vkdnnActivationDescriptor_t
 VKDNN_API vkdnnStatus_t vkdnnActivationForward(vkdnnHandle_t handle, vkdnnActivationDescriptor_t activationDesc,
     const void* alpha, vkdnnTensorDescriptor_t xDesc, const void* x,
     const void* beta, vkdnnTensorDescriptor_t yDesc, void* y);
+/* FP32 contiguous NCHW, equal shapes. y is the unscaled activation output.
+ * ReLU uses x > 0 (zero derivative at +/-0); sigmoid/tanh use y.
+ * Host float alpha/beta; alpha=0 ignores all input addresses, beta=0 ignores old dx.
+ * Otherwise all input ranges must be valid and disjoint from dx (no in-place).
+ * See docs/CNN_OPERATORS.md for NaN semantics and supported configurations. */
 VKDNN_API vkdnnStatus_t vkdnnActivationBackward(vkdnnHandle_t handle, vkdnnActivationDescriptor_t activationDesc,
     const void* alpha, vkdnnTensorDescriptor_t yDesc, const void* y, vkdnnTensorDescriptor_t dyDesc, const void* dy,
     vkdnnTensorDescriptor_t xDesc, const void* x, const void* beta, vkdnnTensorDescriptor_t dxDesc, void* dx);

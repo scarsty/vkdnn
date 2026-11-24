@@ -27,6 +27,7 @@ vkdnnStatus_t copyDtoH(vkdnnHandle_t, void*, vkdnnMemory_t, size_t, size_t);
 vkdnnStatus_t copyDtoD(vkdnnHandle_t, vkdnnMemory_t, size_t, vkdnnMemory_t, size_t, size_t);
 vkdnnStatus_t setMemory(vkdnnHandle_t, vkdnnMemory_t, size_t, int, size_t);
 vkdnnError_t computeBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, const ComputeParams&);
+vkdnnError_t activationBackwardBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ActivationBackwardParams&);
 vkdnnError_t gemmBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const GemmParams&);
 vkdnnError_t convolutionBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ConvolutionParams&);
 }    //namespace vkdnnRuntime
