@@ -10,6 +10,8 @@ layout(push_constant) uniform Params
     uint outputC;
 }
 p;
+shared float reduction[64];
+shared uint invalid[64];
 float loadX(uint i) { return x[p.xOffset + i]; }
 bool isNanBits(float v) { return (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u; }
 void storeY(uint i, float v)
@@ -36,61 +38,160 @@ void storeY(uint i, float v)
     }
     y[p.yOffset + i] = r;
 }
-void main()
+void softmax()
 {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= p.count)
+    uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (group >= p.count) { return; }
+    uint lane = gl_LocalInvocationID.x;
+    uint spatial = p.h * p.w;
+    uint length = p.c * spatial, stride = 1, base = group * length;
+    if (p.mode == 1)
     {
+        length = p.c;
+        stride = spatial;
+        base = (group / spatial) * p.c * spatial + group % spatial;
+    }
+    float m = uintBitsToFloat(0xff800000u);
+    uint bad = 0;
+    for (uint j = lane; j < length; j += 64)
+    {
+        float t = loadX(base + j * stride);
+        if (isNanBits(t)) { bad = 1; }
+        else
+        {
+            m = max(m, t);
+        }
+    }
+    reduction[lane] = m;
+    invalid[lane] = bad;
+    barrier();
+    for (uint step = 32; step > 0; step >>= 1)
+    {
+        if (lane < step)
+        {
+            reduction[lane] = max(reduction[lane], reduction[lane + step]);
+            invalid[lane] |= invalid[lane + step];
+        }
+        barrier();
+    }
+    m = reduction[0];
+    bad = invalid[0];
+    if (isinf(m)) { bad = 1; }
+    // Every lane has captured the maximum before shared storage is reused.
+    barrier();
+    float sum = 0.0;
+    for (uint j = lane; j < length; j += 64)
+    {
+        sum += exp(loadX(base + j * stride) - m);
+    }
+    reduction[lane] = sum;
+    barrier();
+    for (uint step = 32; step > 0; step >>= 1)
+    {
+        if (lane < step) { reduction[lane] += reduction[lane + step]; }
+        barrier();
+    }
+    sum = reduction[0];
+    for (uint j = lane; j < length; j += 64)
+    {
+        float z = loadX(base + j * stride) - m;
+        float v = exp(z) / sum;
+        if (p.op == 3) { v = z - log(sum); }
+        if (bad != 0) { v = uintBitsToFloat(0x7fc00000u); }
+        storeY(base + j * stride, v);
+    }
+}
+void activation(uint i)
+{
+    if (p.alpha == 0.0)
+    {
+        storeY(i, 0.0);
         return;
     }
-    if (p.op == 0)
+    float v = loadX(i);
+    if (p.mode == 0 || p.mode == 2)
     {
-        if (p.alpha == 0.0)
-        {
-            storeY(i, 0.0);
-            return;
-        }
-        float v = loadX(i);
-        if (p.mode == 0 || p.mode == 2)
-        {
-            if (isNanBits(v))
-            {
-                storeY(i, uintBitsToFloat(0x7fc00000u));
-                return;
-            }
-            if (p.mode == 2)
-            {
-                // Avoid overflowing exp for large values and preserve accuracy near zero.
-                if (abs(v) < 0.0001) { storeY(i, v); }
-                else
-                {
-                    float e = exp(-2.0 * min(abs(v), 80.0));
-                    float t = (1.0 - e) / (1.0 + e);
-                    if (v < 0.0) { t = -t; }
-                    storeY(i, t);
-                }
-                return;
-            }
-            float e = exp(-abs(v));
-            if (v >= 0.0) { v = 1.0 / (1.0 + e); }
-            else
-            {
-                v = e / (1.0 + e);
-            }
-            storeY(i, v);
-            return;
-        }
-        bool bad = isNanBits(v) && p.nan == 1;
         if (isNanBits(v))
         {
-            v = 0.0;
+            storeY(i, uintBitsToFloat(0x7fc00000u));
+            return;
         }
-        v = max(v, 0.0);
-        if (bad)
+        if (p.mode == 2)
         {
-            v = uintBitsToFloat(0x7fc00000u);
+            if (abs(v) < 0.0001) { storeY(i, v); }
+            else
+            {
+                float e = exp(-2.0 * min(abs(v), 80.0));
+                float t = (1.0 - e) / (1.0 + e);
+                if (v < 0.0) { t = -t; }
+                storeY(i, t);
+            }
+            return;
+        }
+        float e = exp(-abs(v));
+        if (v >= 0.0) { v = 1.0 / (1.0 + e); }
+        else
+        {
+            v = e / (1.0 + e);
         }
         storeY(i, v);
+        return;
+    }
+    bool bad = isNanBits(v) && p.nan == 1;
+    if (isNanBits(v)) { v = 0.0; }
+    v = max(v, 0.0);
+    if (bad) { v = uintBitsToFloat(0x7fc00000u); }
+    storeY(i, v);
+}
+void main()
+{
+    if (p.op == 2 || p.op == 3)
+    {
+        softmax();
+        return;
+    }
+    uint i = gl_GlobalInvocationID.x;
+    if (p.op == 0)
+    {
+        i *= 4;
+        if (i >= p.count) { return; }
+        if (p.count - i < 4 || p.alpha == 0.0)
+        {
+            for (uint k = 0; k < 4 && i + k < p.count; ++k) { activation(i + k); }
+            return;
+        }
+        vec4 v = vec4(loadX(i), loadX(i + 1), loadX(i + 2), loadX(i + 3));
+        vec4 r;
+        if (p.mode == 0)
+        {
+            vec4 e = exp(-abs(v));
+            r = mix(e / (1.0 + e), 1.0 / (1.0 + e), greaterThanEqual(v, vec4(0.0)));
+        }
+        else if (p.mode == 2)
+        {
+            vec4 e = exp(-2.0 * min(abs(v), vec4(80.0)));
+            r = sign(v) * (1.0 - e) / (1.0 + e);
+            r = mix(r, v, lessThan(abs(v), vec4(0.0001)));
+        }
+        else
+        {
+            r = max(v, vec4(0.0));
+        }
+        for (uint k = 0; k < 4; ++k)
+        {
+            if (isNanBits(v[k]))
+            {
+                r[k] = uintBitsToFloat(0x7fc00000u);
+                if (p.mode == 1 && p.nan == 0) { r[k] = 0.0; }
+            }
+            storeY(i + k, r[k]);
+        }
+        return;
+    }
+    if (i >= p.count) { return; }
+    if (p.op == 5)
+    {
+        y[p.yOffset + i] = p.alpha;
     }
     else if (p.op == 4)
     {
@@ -161,44 +262,5 @@ void main()
             v = uintBitsToFloat(0x7fc00000u);
         }
         storeY(i, v);
-    }
-    else
-    {
-        uint spatial = p.h * p.w;
-        uint length = p.c * spatial, stride = 1, base = i * length;
-        if (p.mode == 1)
-        {
-            length = p.c;
-            stride = spatial;
-            base = (i / spatial) * p.c * spatial + i % spatial;
-        }
-        float m = uintBitsToFloat(0xff800000u);
-        bool bad = false;
-        for (uint j = 0; j < length; ++j)
-        {
-            float t = loadX(base + j * stride);
-            bad = bad || isNanBits(t);
-            m = max(m, t);
-        }
-        bad = bad || isinf(m);
-        float sum = 0.0;
-        for (uint j = 0; j < length; ++j)
-        {
-            sum += exp(loadX(base + j * stride) - m);
-        }
-        for (uint j = 0; j < length; ++j)
-        {
-            float z = loadX(base + j * stride) - m;
-            float v = exp(z) / sum;
-            if (p.op == 3)
-            {
-                v = z - log(sum);
-            }
-            if (bad)
-            {
-                v = uintBitsToFloat(0x7fc00000u);
-            }
-            storeY(base + j * stride, v);
-        }
     }
 }

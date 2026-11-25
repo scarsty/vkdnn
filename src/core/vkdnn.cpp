@@ -38,6 +38,27 @@ struct vkdnnMemory
 
 struct vkdnnContext
 {
+    struct ComputeResources
+    {
+        VkDevice device;
+        const uint32_t* code;
+        size_t codeSize;
+        uint32_t bufferCount, paramSize;
+        VkShaderModule shader = VK_NULL_HANDLE;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        ~ComputeResources()
+        {
+            if (pool) { vkDestroyDescriptorPool(device, pool, nullptr); }
+            if (pipeline) { vkDestroyPipeline(device, pipeline, nullptr); }
+            if (layout) { vkDestroyPipelineLayout(device, layout, nullptr); }
+            if (setLayout) { vkDestroyDescriptorSetLayout(device, setLayout, nullptr); }
+            if (shader) { vkDestroyShaderModule(device, shader, nullptr); }
+        }
+    };
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -47,11 +68,15 @@ struct vkdnnContext
     VkFence fence = VK_NULL_HANDLE;
     int index = -1;
     std::unordered_set<vkdnnMemory_t> allocations;
+    // Runtime calls serialize and wait for the fence before reusing descriptors.
+    // Contexts are explicitly reset, not deleted by DLL process-detach cleanup.
+    std::vector<std::unique_ptr<ComputeResources>> compute;
 
     ~vkdnnContext()
     {
         if (device)
         {
+            compute.clear();
             if (fence) { vkDestroyFence(device, fence, nullptr); }
             if (pool) { vkDestroyCommandPool(device, pool, nullptr); }
             vkDestroyDevice(device, nullptr);
@@ -78,38 +103,6 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
     {
         if (memory[i]->size > properties.limits.maxStorageBufferRange) { return vkdnnErrorNotSupported; }
     }
-    struct Resources
-    {
-        VkDevice device;
-        VkShaderModule shader = VK_NULL_HANDLE;
-        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
-        VkPipelineLayout layout = VK_NULL_HANDLE;
-        VkPipeline pipeline = VK_NULL_HANDLE;
-        VkDescriptorPool pool = VK_NULL_HANDLE;
-        ~Resources()
-        {
-            if (pool)
-            {
-                vkDestroyDescriptorPool(device, pool, nullptr);
-            }
-            if (pipeline)
-            {
-                vkDestroyPipeline(device, pipeline, nullptr);
-            }
-            if (layout)
-            {
-                vkDestroyPipelineLayout(device, layout, nullptr);
-            }
-            if (setLayout)
-            {
-                vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
-            }
-            if (shader)
-            {
-                vkDestroyShaderModule(device, shader, nullptr);
-            }
-        }
-    } r{ context->device };
     auto status = [](VkResult result)
     {
         if (result == VK_SUCCESS)
@@ -126,72 +119,96 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
         }
         return vkdnnErrorUnknown;
     };
-    VkShaderModuleCreateInfo shader{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    shader.codeSize = codeSize;
-    shader.pCode = code;
-    VkResult result = vkCreateShaderModule(r.device, &shader, nullptr, &r.shader);
-    if (result != VK_SUCCESS)
+    vkdnnContext::ComputeResources* cached = nullptr;
+    for (const auto& entry : context->compute)
     {
-        return status(result);
+        if (entry->code == code && entry->codeSize == codeSize
+            && entry->bufferCount == bufferCount && entry->paramSize == paramSize)
+        {
+            cached = entry.get();
+            break;
+        }
     }
-    VkDescriptorSetLayoutBinding bindings[4]{};
-    for (uint32_t i = 0; i < bufferCount; ++i)
+    VkResult result = VK_SUCCESS;
+    if (!cached)
     {
-        bindings[i].binding = i;
-        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        auto pending = std::make_unique<vkdnnContext::ComputeResources>();
+        auto& r = *pending;
+        r.device = context->device;
+        r.code = code;
+        r.codeSize = codeSize;
+        r.bufferCount = bufferCount;
+        r.paramSize = paramSize;
+        VkShaderModuleCreateInfo shader{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        shader.codeSize = codeSize;
+        shader.pCode = code;
+        result = vkCreateShaderModule(r.device, &shader, nullptr, &r.shader);
+        if (result != VK_SUCCESS)
+        {
+            return status(result);
+        }
+        VkDescriptorSetLayoutBinding bindings[4]{};
+        for (uint32_t i = 0; i < bufferCount; ++i)
+        {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo setInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        setInfo.bindingCount = bufferCount;
+        setInfo.pBindings = bindings;
+        result = vkCreateDescriptorSetLayout(r.device, &setInfo, nullptr, &r.setLayout);
+        if (result != VK_SUCCESS)
+        {
+            return status(result);
+        }
+        VkPushConstantRange push{ VK_SHADER_STAGE_COMPUTE_BIT, 0, paramSize };
+        VkPipelineLayoutCreateInfo layout{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &r.setLayout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &push;
+        result = vkCreatePipelineLayout(r.device, &layout, nullptr, &r.layout);
+        if (result != VK_SUCCESS)
+        {
+            return status(result);
+        }
+        VkComputePipelineCreateInfo pipeline{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline.stage.module = r.shader;
+        pipeline.stage.pName = "main";
+        pipeline.layout = r.layout;
+        result = vkCreateComputePipelines(r.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &r.pipeline);
+        if (result != VK_SUCCESS)
+        {
+            return status(result);
+        }
+        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bufferCount };
+        VkDescriptorPoolCreateInfo pool{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        pool.maxSets = 1;
+        pool.poolSizeCount = 1;
+        pool.pPoolSizes = &poolSize;
+        result = vkCreateDescriptorPool(r.device, &pool, nullptr, &r.pool);
+        if (result != VK_SUCCESS)
+        {
+            return status(result);
+        }
+        VkDescriptorSetAllocateInfo allocate{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        allocate.descriptorPool = r.pool;
+        allocate.descriptorSetCount = 1;
+        allocate.pSetLayouts = &r.setLayout;
+        result = vkAllocateDescriptorSets(r.device, &allocate, &r.set);
+        if (result != VK_SUCCESS)
+        {
+            return status(result);
+        }
+        cached = pending.get();
+        context->compute.push_back(std::move(pending));
     }
-    VkDescriptorSetLayoutCreateInfo setInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    setInfo.bindingCount = bufferCount;
-    setInfo.pBindings = bindings;
-    result = vkCreateDescriptorSetLayout(r.device, &setInfo, nullptr, &r.setLayout);
-    if (result != VK_SUCCESS)
-    {
-        return status(result);
-    }
-    VkPushConstantRange push{ VK_SHADER_STAGE_COMPUTE_BIT, 0, paramSize };
-    VkPipelineLayoutCreateInfo layout{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &r.setLayout;
-    layout.pushConstantRangeCount = 1;
-    layout.pPushConstantRanges = &push;
-    result = vkCreatePipelineLayout(r.device, &layout, nullptr, &r.layout);
-    if (result != VK_SUCCESS)
-    {
-        return status(result);
-    }
-    VkComputePipelineCreateInfo pipeline{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    pipeline.stage.module = r.shader;
-    pipeline.stage.pName = "main";
-    pipeline.layout = r.layout;
-    result = vkCreateComputePipelines(r.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &r.pipeline);
-    if (result != VK_SUCCESS)
-    {
-        return status(result);
-    }
-    VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bufferCount };
-    VkDescriptorPoolCreateInfo pool{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pool.maxSets = 1;
-    pool.poolSizeCount = 1;
-    pool.pPoolSizes = &poolSize;
-    result = vkCreateDescriptorPool(r.device, &pool, nullptr, &r.pool);
-    if (result != VK_SUCCESS)
-    {
-        return status(result);
-    }
-    VkDescriptorSetAllocateInfo allocate{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocate.descriptorPool = r.pool;
-    allocate.descriptorSetCount = 1;
-    allocate.pSetLayouts = &r.setLayout;
-    VkDescriptorSet set;
-    result = vkAllocateDescriptorSets(r.device, &allocate, &set);
-    if (result != VK_SUCCESS)
-    {
-        return status(result);
-    }
+    auto& r = *cached;
+    VkDescriptorSet set = r.set;
     VkDescriptorBufferInfo buffers[4]{};
     VkWriteDescriptorSet writes[4]{};
     for (uint32_t i = 0; i < bufferCount; ++i)
@@ -259,7 +276,22 @@ vkdnnError_t vkdnnRuntime::activationBackwardBuffers(vkdnnHandle_t context, vkdn
 vkdnnError_t vkdnnRuntime::computeBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t y, const ComputeParams& params)
 {
     vkdnnMemory_t buffers[] = { x, y };
-    return dispatchBuffers(context, buffers, 2, forwardSpirv, sizeof(forwardSpirv), &params, sizeof(params), (params.count + 63u) / 64u, 1);
+    uint32_t groups = (params.count + 63u) / 64u;
+    uint32_t groupsY = 1;
+    if (params.op == 0) { groups = (params.count + 255u) / 256u; }
+    if (params.op == 2 || params.op == 3)
+    {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(context->physical, &properties);
+        groups = params.count;
+        uint32_t limit = properties.limits.maxComputeWorkGroupCount[0];
+        if (groups > limit)
+        {
+            groupsY = (groups - 1u) / limit + 1u;
+            groups = limit;
+        }
+    }
+    return dispatchBuffers(context, buffers, 2, forwardSpirv, sizeof(forwardSpirv), &params, sizeof(params), groups, groupsY);
 }
 
 vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t w, vkdnnMemory_t y, const ConvolutionParams& params)

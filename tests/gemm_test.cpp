@@ -87,6 +87,42 @@ static void numerical(vkblasHandle_t handle, vkblasOperation_t ta, vkblasOperati
     RT(vkdnnFree(dc));
 }
 
+static void scaling(vkblasHandle_t handle)
+{
+    for (int n : { 1, 19, 257, 65537 })
+    {
+        for (int incx : { 1, 3 })
+        {
+            const size_t prefix = 3;
+            size_t extent = size_t(n - 1) * incx + 1;
+            std::vector<float> original(prefix + extent + 2, -123.f);
+            for (int i = 0; i < n; ++i) { original[prefix + size_t(i) * incx] = float(i % 17 - 8) / 4; }
+            for (float alpha : { -2.f, 0.f, 1.f, 0.7f })
+            {
+                auto actual = original;
+                auto expected = original;
+                for (int i = 0; i < n; ++i) { expected[prefix + size_t(i) * incx] *= alpha; }
+                void* device = nullptr;
+                RT(vkdnnMalloc(&device, actual.size() * sizeof(float)));
+                RT(vkdnnMemcpy(device, actual.data(), actual.size() * sizeof(float), vkdnnMemcpyHostToDevice));
+                OK(vkblasSscal(handle, n, &alpha, static_cast<float*>(device) + prefix, incx));
+                RT(vkdnnMemcpy(actual.data(), device, actual.size() * sizeof(float), vkdnnMemcpyDeviceToHost));
+                for (size_t i = 0; i < actual.size(); ++i) { REQUIRE(std::abs(actual[i] - expected[i]) <= 1e-6f); }
+                RT(vkdnnFree(device));
+            }
+        }
+    }
+    float alpha = 0;
+    std::vector<float> special = { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -2.f };
+    void* device = nullptr;
+    RT(vkdnnMalloc(&device, special.size() * sizeof(float)));
+    RT(vkdnnMemcpy(device, special.data(), special.size() * sizeof(float), vkdnnMemcpyHostToDevice));
+    OK(vkblasSscal(handle, 3, &alpha, static_cast<float*>(device), 1));
+    RT(vkdnnMemcpy(special.data(), device, special.size() * sizeof(float), vkdnnMemcpyDeviceToHost));
+    REQUIRE(std::isnan(special[0]) && std::isnan(special[1]) && special[2] == 0 && std::signbit(special[2]));
+    RT(vkdnnFree(device));
+}
+
 int main()
 {
     int count = 0;
@@ -105,6 +141,12 @@ int main()
     REQUIRE(vkblasDestroy(nullptr) == VKBLAS_STATUS_NOT_INITIALIZED);
     REQUIRE(vkblasSetPointerMode(nullptr, VKBLAS_POINTER_MODE_HOST) == VKBLAS_STATUS_NOT_INITIALIZED);
     OK(vkblasCreate(&handle));
+    REQUIRE(vkblasSscal(nullptr, 0, nullptr, nullptr, 1) == VKBLAS_STATUS_NOT_INITIALIZED);
+    OK(vkblasSscal(handle, 0, nullptr, nullptr, 1));
+    OK(vkblasSscal(handle, -1, nullptr, nullptr, 1));
+    OK(vkblasSscal(handle, 3, nullptr, nullptr, 0));
+    OK(vkblasSscal(handle, 3, nullptr, nullptr, -1));
+    scaling(handle);
     REQUIRE(vkblasSetPointerMode(handle, VKBLAS_POINTER_MODE_DEVICE) == VKBLAS_STATUS_NOT_SUPPORTED);
     REQUIRE(vkblasSetPointerMode(handle, static_cast<vkblasPointerMode_t>(99)) == VKBLAS_STATUS_INVALID_VALUE);
     for (auto ta : { VKBLAS_OP_N, VKBLAS_OP_T, VKBLAS_OP_C })
@@ -129,6 +171,15 @@ int main()
     RT(vkdnnMalloc(&a, 64));
     RT(vkdnnMalloc(&b, 64));
     RT(vkdnnMalloc(&c, 64));
+    REQUIRE(vkblasSscal(handle, 1, nullptr, static_cast<float*>(a), 1) == VKBLAS_STATUS_INVALID_VALUE);
+    REQUIRE(vkblasSscal(handle, 1, static_cast<float*>(b), static_cast<float*>(a), 1) == VKBLAS_STATUS_INVALID_VALUE);
+    REQUIRE(vkblasSscal(handle, 1, &one, nullptr, 1) == VKBLAS_STATUS_INVALID_VALUE);
+    REQUIRE(vkblasSscal(handle, 1, &one, &one, 1) == VKBLAS_STATUS_INVALID_VALUE);
+    REQUIRE(vkblasSscal(handle, 1, &one, reinterpret_cast<float*>(static_cast<char*>(a) + 1), 1) == VKBLAS_STATUS_INVALID_VALUE);
+    REQUIRE(vkblasSscal(handle, 6, &one, static_cast<float*>(a) + 1, 3) == VKBLAS_STATUS_INVALID_VALUE);
+    REQUIRE(vkblasSscal(handle, std::numeric_limits<int>::max(), &one, static_cast<float*>(a), 3) == VKBLAS_STATUS_NOT_SUPPORTED);
+    RT(vkdnnMemset(a, 0, 64));
+    OK(vkblasSscal(handle, 6, &one, static_cast<float*>(a), 3));
     auto call = [&](const float* ap, const float* bp, float* cp, int lda = 2)
     {
         return vkblasSgemm(handle, VKBLAS_OP_N, VKBLAS_OP_N, 2, 2, 2, &one, ap, lda, bp, 2, &one, cp, 2);
@@ -151,10 +202,12 @@ int main()
     if (count > 1)
     {
         RT(vkdnnSetDevice(1));
+        REQUIRE(vkblasSscal(handle, 0, nullptr, nullptr, 1) == VKBLAS_STATUS_INVALID_VALUE);
         REQUIRE(call(static_cast<float*>(a), static_cast<float*>(b), static_cast<float*>(c)) == VKBLAS_STATUS_INVALID_VALUE);
         void* foreign = nullptr;
         RT(vkdnnMalloc(&foreign, 64));
         RT(vkdnnSetDevice(0));
+        REQUIRE(vkblasSscal(handle, 1, &one, static_cast<float*>(foreign), 1) == VKBLAS_STATUS_INVALID_VALUE);
         REQUIRE(call(static_cast<float*>(foreign), static_cast<float*>(b), static_cast<float*>(c)) == VKBLAS_STATUS_INVALID_VALUE);
         RT(vkdnnSetDevice(1));
         RT(vkdnnFree(foreign));
@@ -182,12 +235,14 @@ int main()
                 static_cast<float*>(b), 1, &one, static_cast<float*>(c), std::numeric_limits<int>::max())
         == VKBLAS_STATUS_NOT_SUPPORTED);
     RT(vkdnnFree(a));
+    REQUIRE(vkblasSscal(handle, 1, &one, static_cast<float*>(a), 1) == VKBLAS_STATUS_INVALID_VALUE);
     RT(vkdnnFree(b));
     RT(vkdnnFree(c));
     RT(vkdnnDeviceReset());
+    scaling(handle);
     numerical(handle, VKBLAS_OP_N, VKBLAS_OP_T, 7, 3, 5, 1, 0);
     OK(vkblasDestroy(handle));
     RT(vkdnnDeviceReset());
-    std::puts("PASS: Vulkan tiled SGEMM and CPU reference, bounds, zero-access and lifecycle");
+    std::puts("PASS: Vulkan SGEMM/Sscal and CPU reference, bounds, zero-access and lifecycle");
     return 0;
 }

@@ -39,6 +39,12 @@ typedef enum vkblasPointerMode_t
 VKDNN_API vkblasStatus_t vkblasCreate(vkblasHandle_t* handle);
 VKDNN_API vkblasStatus_t vkblasDestroy(vkblasHandle_t handle);
 VKDNN_API vkblasStatus_t vkblasSetPointerMode(vkblasHandle_t handle, vkblasPointerMode_t mode);
+/* Synchronous in-place FP32 scaling: x[i*incx] *= *alpha (0 <= i < n).
+ * n<=0 or incx<=0 is a successful no-op without accessing alpha/x, after
+ * handle/current-device validation. Otherwise alpha is HOST and x must be an
+ * aligned runtime allocation/view spanning (n-1)*incx+1 floats on that device.
+ * Gaps are preserved; multiplication reads x even when alpha is zero. */
+VKDNN_API vkblasStatus_t vkblasSscal(vkblasHandle_t handle, int n, const float* alpha, float* x, int incx);
 VKDNN_API vkblasStatus_t vkblasSgemm(vkblasHandle_t handle, vkblasOperation_t transa, vkblasOperation_t transb,
     int m, int n, int k, const float* alpha, const float* A, int lda,
     const float* B, int ldb, const float* beta, float* C, int ldc);

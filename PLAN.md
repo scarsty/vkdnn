@@ -8,11 +8,11 @@
 
 本计划为初始设计；里程碑按交付物推进，不在缺少开发投入与设备信息时承诺日历工期。
 
-当前已落地公共运行时、CMake 动态库、设备/显存测试、FP32 列主序 tiled SGEMM，以及 FP32 NCHW 直接卷积、AddTensor 偏置/逐轴广播及残差加法、ReLU/Sigmoid/tanh、Pooling、ACCURATE/LOG Softmax 前向与 CPU 参考对照测试。卷积覆盖 batch/groups/depthwise、矩形核、padding/stride/dilation 与核翻转，DIRECT 零 workspace，IMPLICIT_GEMM 不支持。M1 已实现 Vulkan 1.2 设备查询、上下文、device-local 显存分配/释放、staging 上传/下载、同步设备内复制、字节填充与同步；非对齐设备复制和 memset 暂经主机中转。已有 GLSL → 嵌入式 SPIR-V 构建链和真实 compute 闭环；GEMM 的 batch/设备 scalar 模式、vector add、反向、性能优化、完整许可证与 CI 工作仍待完成。LeNet 的 bias、tanh 已完成，但网络示例、预训练参数、权重加载/预处理及布局衔接仍待实现，完整训练另缺专用反向、损失和优化器；精确支持范围见 docs/CNN_OPERATORS.md。
+当前已落地公共运行时、CMake 动态库、设备/显存测试、FP32 列主序 tiled SGEMM，以及 FP32 NCHW 直接卷积、AddTensor 偏置/逐轴广播及残差加法、ReLU/Sigmoid/tanh、Pooling、Softmax 前向和反向与 CPU 参考对照测试。卷积覆盖 batch/groups/depthwise、矩形核、padding/stride/dilation 与核翻转，DIRECT 零 workspace，IMPLICIT_GEMM 不支持。M1 已实现 Vulkan 1.2 设备查询、上下文、device-local 显存分配/释放、staging 上传/下载、同步设备内复制、字节填充与同步；非对齐设备复制和 memset 暂经主机中转。已有 GLSL → 嵌入式 SPIR-V 构建链和真实 compute 闭环；GEMM 的 batch/设备 scalar 模式、性能优化、完整许可证与 CI 工作仍待完成。LeNet 的算子积木不等于端到端模型验证；精确支持范围见 docs/CNN_OPERATORS.md。
 
 ## 2. 首期范围与约束
 
-激活反向已落地：FP32 连续 NCHW/batch 的 ReLU、Sigmoid、tanh，独立 Vulkan compute shader；CPU 参考及实际 GPU 前向目标有限差分验收见 `tests/activation_backward_test.cpp`。这是 M5 的第一项增量，其余卷积/bias、池化、Softmax 专用反向仍为桩；不代表训练闭环已完成。
+激活反向已落地：FP32 连续 NCHW/batch 的 ReLU、Sigmoid、tanh，独立 Vulkan compute shader；CPU 参考及实际 GPU 前向目标有限差分验收见 `tests/activation_backward_test.cpp`。卷积 dx/dw/db 与池化反向现已补齐零 workspace gather baseline，CPU 参考及 CPU/GPU 前向有限差分见 `tests/cnn_backward_test.cpp`。SetTensor、OpTensor ADD/MUL、Softmax FAST/ACCURATE/LOG 前向及反向已补齐，CPU/GPU 差分见 `tests/cnn_forward_test.cpp`。BLAS 已补 Sscal；卷积算法查询见 `docs/CONVOLUTION_QUERY.md`。组网、损失和优化器由 cccc 等调用工程负责，不属于本库实现范围；端到端训练尚未验证。
 
 - 单设备、单计算队列，不引入多 GPU 或分布式通信。
 - 宿主实现采用 C++17，对外采用 C ABI，基础运行时形式向 CUDA Runtime 靠拢（当前设备、隐式上下文、void* 显存地址及复制方向枚举）；公开 API 在试验阶段允许调整，发布前再制定兼容策略。

@@ -12,6 +12,12 @@ typedef struct vkdnnFilterStruct* vkdnnFilterDescriptor_t;
 typedef struct vkdnnConvolutionStruct* vkdnnConvolutionDescriptor_t;
 typedef struct vkdnnActivationStruct* vkdnnActivationDescriptor_t;
 typedef struct vkdnnPoolingStruct* vkdnnPoolingDescriptor_t;
+typedef struct vkdnnOpTensorStruct* vkdnnOpTensorDescriptor_t;
+typedef enum vkdnnOpTensorOp_t
+{
+    VKDNN_OP_TENSOR_ADD = 0,
+    VKDNN_OP_TENSOR_MUL = 1
+} vkdnnOpTensorOp_t;
 typedef enum vkdnnStatus_t
 {
     VKDNN_STATUS_SUCCESS = 0,
@@ -78,17 +84,19 @@ typedef enum vkdnnConvolutionFwdAlgo_t
 } vkdnnConvolutionFwdAlgo_t;
 typedef enum vkdnnConvolutionBwdDataAlgo_t
 {
+    /* Local zero-workspace gather baseline, NOT cuDNN's atomic/non-deterministic implementation. */
     VKDNN_CONVOLUTION_BWD_DATA_ALGO_0 = 0
 } vkdnnConvolutionBwdDataAlgo_t;
 typedef enum vkdnnConvolutionBwdFilterAlgo_t
 {
+    /* Same local implementation deviation as BWD_DATA_ALGO_0; see CNN_OPERATORS.md. */
     VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0 = 0
 } vkdnnConvolutionBwdFilterAlgo_t;
 
 /* Implemented: handle/tensor/filter/convolution/ReLU/sigmoid/tanh/pooling descriptors and their forward calls,
- * AddTensor broadcasting, ACCURATE/LOG softmax and ReLU/sigmoid/tanh backward.
+ * AddTensor broadcasting, ACCURATE/LOG softmax, activation/pooling and convolution dx/dw/db backward.
  * FP32 contiguous NCHW only; see CNN_OPERATORS.md.
- * Other calls remain NOT_SUPPORTED stubs without output writes or GPU work. */
+ * SetTensor, OpTensor ADD/MUL and FAST/ACCURATE/LOG softmax backward are implemented. */
 VKDNN_API vkdnnStatus_t vkdnnCreate(vkdnnHandle_t* handle);
 VKDNN_API vkdnnStatus_t vkdnnDestroy(vkdnnHandle_t handle);
 VKDNN_API vkdnnStatus_t vkdnnCreateTensorDescriptor(vkdnnTensorDescriptor_t* tensorDesc);
@@ -114,6 +122,10 @@ VKDNN_API vkdnnStatus_t vkdnnConvolutionForward(vkdnnHandle_t handle, const void
     vkdnnTensorDescriptor_t xDesc, const void* x, vkdnnFilterDescriptor_t wDesc, const void* w,
     vkdnnConvolutionDescriptor_t convDesc, vkdnnConvolutionFwdAlgo_t algo,
     void* workSpace, size_t workSpaceSizeInBytes, const void* beta, vkdnnTensorDescriptor_t yDesc, void* y);
+/* Backward: FP32 contiguous NCHW, host float alpha/beta; out=alpha*gradient+beta*out.
+ * ALGO_0 is the local gather baseline (zero workspace; optional workspace arguments ignored).
+ * alpha=0 ignores input addresses; beta=0 never reads old output. Inputs may alias each other,
+ * but accessed input/output ranges must not overlap. Bias descriptor must be [1,K,1,1]. */
 VKDNN_API vkdnnStatus_t vkdnnGetConvolutionBackwardDataWorkspaceSize(vkdnnHandle_t handle,
     vkdnnFilterDescriptor_t wDesc, vkdnnTensorDescriptor_t dyDesc, vkdnnConvolutionDescriptor_t convDesc,
     vkdnnTensorDescriptor_t dxDesc, vkdnnConvolutionBwdDataAlgo_t algo, size_t* sizeInBytes);
@@ -135,6 +147,19 @@ VKDNN_API vkdnnStatus_t vkdnnConvolutionBackwardBias(vkdnnHandle_t handle, const
  * Registered, float-aligned device ranges only; errors leave C unchanged. */
 VKDNN_API vkdnnStatus_t vkdnnAddTensor(vkdnnHandle_t handle, const void* alpha,
     vkdnnTensorDescriptor_t aDesc, const void* A, const void* beta, vkdnnTensorDescriptor_t cDesc, void* C);
+VKDNN_API vkdnnStatus_t vkdnnSetTensor(vkdnnHandle_t handle, vkdnnTensorDescriptor_t yDesc, void* y, const void* valuePtr);
+VKDNN_API vkdnnStatus_t vkdnnCreateOpTensorDescriptor(vkdnnOpTensorDescriptor_t* opTensorDesc);
+VKDNN_API vkdnnStatus_t vkdnnDestroyOpTensorDescriptor(vkdnnOpTensorDescriptor_t opTensorDesc);
+VKDNN_API vkdnnStatus_t vkdnnSetOpTensorDescriptor(vkdnnOpTensorDescriptor_t opTensorDesc,
+    vkdnnOpTensorOp_t opTensorOp, vkdnnDataType_t opTensorCompType, vkdnnNanPropagation_t opTensorNanOpt);
+VKDNN_API vkdnnStatus_t vkdnnGetOpTensorDescriptor(vkdnnOpTensorDescriptor_t opTensorDesc,
+    vkdnnOpTensorOp_t* opTensorOp, vkdnnDataType_t* opTensorCompType, vkdnnNanPropagation_t* opTensorNanOpt);
+/* FP32 NCHW; A matches C, B broadcasts per axis. Accessed inputs must not overlap C.
+ * C=op(alpha1*A,alpha2*B)+beta*C. Host scalars; zero scales skip input access. */
+VKDNN_API vkdnnStatus_t vkdnnOpTensor(vkdnnHandle_t handle, vkdnnOpTensorDescriptor_t opTensorDesc,
+    const void* alpha1, vkdnnTensorDescriptor_t aDesc, const void* A,
+    const void* alpha2, vkdnnTensorDescriptor_t bDesc, const void* B,
+    const void* beta, vkdnnTensorDescriptor_t cDesc, void* C);
 VKDNN_API vkdnnStatus_t vkdnnCreateActivationDescriptor(vkdnnActivationDescriptor_t* activationDesc);
 VKDNN_API vkdnnStatus_t vkdnnDestroyActivationDescriptor(vkdnnActivationDescriptor_t activationDesc);
 VKDNN_API vkdnnStatus_t vkdnnSetActivationDescriptor(vkdnnActivationDescriptor_t activationDesc,
@@ -160,6 +185,11 @@ VKDNN_API vkdnnStatus_t vkdnnGetPooling2dForwardOutputDim(vkdnnPoolingDescriptor
 VKDNN_API vkdnnStatus_t vkdnnPoolingForward(vkdnnHandle_t handle, vkdnnPoolingDescriptor_t poolingDesc,
     const void* alpha, vkdnnTensorDescriptor_t xDesc, const void* x,
     const void* beta, vkdnnTensorDescriptor_t yDesc, void* y);
+/* Pooling backward recomputes winners from x: first row-major maximum wins ties (including -Inf).
+ * y must describe the matching unscaled forward result; its range is validated, values are not read.
+ * PROPAGATE_NAN: a NaN window gives NaN to every covered dx. NOT_PROPAGATE_NAN:
+ * NaN x entries receive no gradient; all-NaN max windows have no winner.
+ * Average uses the forward divisor; ignored NaNs still count. Same scalar/range rules as above. */
 VKDNN_API vkdnnStatus_t vkdnnPoolingBackward(vkdnnHandle_t handle, vkdnnPoolingDescriptor_t poolingDesc,
     const void* alpha, vkdnnTensorDescriptor_t yDesc, const void* y, vkdnnTensorDescriptor_t dyDesc, const void* dy,
     vkdnnTensorDescriptor_t xDesc, const void* x, const void* beta, vkdnnTensorDescriptor_t dxDesc, void* dx);
@@ -173,4 +203,5 @@ VKDNN_API vkdnnStatus_t vkdnnSoftmaxBackward(vkdnnHandle_t handle, vkdnnSoftmaxA
 #ifdef __cplusplus
 }
 #endif
+#include "vkdnn_conv_query.h"
 #endif

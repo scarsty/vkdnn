@@ -2,7 +2,7 @@
 
 基于 Vulkan Compute 的深度学习计算基础库，目标是提供类似 cuBLAS 的矩阵计算能力与类似 cuDNN 的神经网络算子能力，为推理和训练框架提供跨 GPU 厂商的底层计算后端。
 
-> 已实现 Vulkan 1.2 运行时、FP32 列主序 tiled SGEMM，以及 FP32 连续 NCHW 的直接二维卷积（batch/groups/depthwise、padding/stride/dilation、卷积核翻转）、AddTensor 偏置/逐轴广播及残差加法、ReLU/Sigmoid/tanh、最大/平均池化、稳定 Softmax/LogSoftmax 真实 GPU 前向，以及 ReLU/Sigmoid/tanh 激活反向。卷积选择 `VKDNN_CONVOLUTION_FWD_ALGO_DIRECT`，workspace 为零；IMPLICIT_GEMM 保留但不支持。其余专用反向、网络示例、预训练参数与完整训练仍未实现，暂无性能数据。实现顺序和验收标准见 [开发计划](PLAN.md)。
+> 已实现 Vulkan 1.2 运行时、FP32 列主序 tiled SGEMM，以及 FP32 连续 NCHW 的直接二维卷积（batch/groups/depthwise、padding/stride/dilation、卷积核翻转）、AddTensor 偏置/逐轴广播及残差加法、ReLU/Sigmoid/tanh、最大/平均池化、稳定 Softmax/LogSoftmax 真实 GPU 前向，以及激活、池化、卷积 dx/dw/db 和 Softmax 反向。新增 SetTensor 常数填充与 OpTensor ADD/MUL 广播；Softmax FAST 复用稳定路径。卷积选择 `VKDNN_CONVOLUTION_FWD_ALGO_DIRECT`，workspace 为零；IMPLICIT_GEMM 保留但不支持。组网、损失、参数更新由 cccc 等调用工程负责，尚未验证端到端训练，暂无性能数据。实现顺序和验收标准见 [开发计划](PLAN.md)。
 
 ## 项目定位
 
@@ -15,9 +15,11 @@
 
 ## 能力路线
 
-基本 CNN 的前向/反向算子与参考接口见 [CNN 算子清单及 LeNet 缺口](docs/CNN_OPERATORS.md)。[DNN 头文件](include/vkdnn/vkdnn_ops.h) 中句柄、tensor/filter/convolution/activation/pooling 描述符及卷积、AddTensor、激活、池化、softmax 前向和激活反向已实现，支持 batch、alpha/beta，确切 NaN/布局/别名限制见该文档；其余 DNN 仍返回 `NOT_SUPPORTED`。[BLAS](include/vkdnn/vkblas.h) 已实现同步 FP32 SGEMM、N/T/C、padded leading dimension 与宿主 alpha/beta；设备 scalar pointer mode 暂不支持。
+基本 CNN 的前向/反向算子与参考接口见 [CNN 算子清单及 LeNet 缺口](docs/CNN_OPERATORS.md)。[DNN 头文件](include/vkdnn/vkdnn_ops.h) 中句柄、tensor/filter/convolution/activation/pooling 描述符及卷积、AddTensor、激活、池化、softmax 前向及激活/池化/卷积反向已实现，支持 batch、alpha/beta，确切 NaN/布局/别名限制见该文档；其余 DNN 仍返回 `NOT_SUPPORTED`。[BLAS](include/vkdnn/vkblas.h) 已实现同步 FP32 SGEMM、N/T/C、padded leading dimension 与宿主 alpha/beta；设备 scalar pointer mode 暂不支持。
 
 已在 [third_party/ncnn](third_party/ncnn/README.md) 保存固定版本参考快照，保留上游 BSD-3-Clause 许可；不参与构建。`src/ops/forward.comp` 和宿主调度为独立实现，构建期使用 Vulkan SDK `glslc` 生成嵌入式 SPIR-V，运行时无需 shader 文件或编译器。
+
+前向现采用 context 所属 pipeline/descriptor 复用、vec4 激活运算和 workgroup 并行 Softmax；RTX 5090 暖调用对比、验证与限制见 [前向性能记录](docs/FORWARD_PERFORMANCE.md)。这不是与 ncnn 的性能比较，也不是端到端训练验证。
 
 以下均为规划内容，具体支持范围以未来发布版本为准。
 
@@ -27,7 +29,7 @@
 | 矩阵计算 | FP32 GEMM，支持转置、leading dimension、alpha/beta | batched/strided-batched GEMM、向量运算、低精度矩阵乘法 |
 | 张量基础 | shape、stride、layout 描述，连续布局校验 | 受限广播、布局转换、非连续布局的明确支持范围 |
 | 推理算子 | elementwise、activation、reduction、softmax、conv2d、pooling | normalization、融合算子、更多卷积算法 |
-| 训练基础 | 在前向算子稳定后提供反向计算 | 卷积梯度、归一化梯度及混合精度支持 |
+| 训练基础 | 在前向算子稳定后提供反向计算 | 已实现卷积/池化/激活梯度；归一化梯度及混合精度待实现 |
 
 不在首期范围：多 GPU、分布式通信、稀疏计算、量化部署、模型格式解析，以及对 cuDNN/cuBLAS 的逐 API 复刻。
 

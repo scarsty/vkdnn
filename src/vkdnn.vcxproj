@@ -46,12 +46,14 @@
     <ClCompile Include="core\runtime.cpp" />
     <ClCompile Include="core\vkdnn.cpp" />
     <ClCompile Include="ops\cnn_stubs.cpp" />
+    <ClCompile Include="ops\convolution_query.cpp" />
     <ClCompile Include="ops\forward.cpp" />
     <ClCompile Include="ops\gemm.cpp" />
     <ClInclude Include="core\compute_internal.h" />
     <ClInclude Include="core\runtime_internal.h" />
     <ClInclude Include="..\include\vkdnn\vkdnn.h" />
     <ClInclude Include="..\include\vkdnn\vkdnn_ops.h" />
+    <ClInclude Include="..\include\vkdnn\vkdnn_conv_query.h" />
     <ClInclude Include="..\include\vkdnn\vkblas.h" />
     <None Include="ops\forward.comp" />
     <None Include="ops\gemm.comp" />

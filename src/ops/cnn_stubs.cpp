@@ -1,9 +1,3 @@
 #include "vkdnn/vkdnn_ops.h"
 
-vkdnnStatus_t vkdnnGetConvolutionBackwardDataWorkspaceSize(vkdnnHandle_t, vkdnnFilterDescriptor_t, vkdnnTensorDescriptor_t, vkdnnConvolutionDescriptor_t, vkdnnTensorDescriptor_t, vkdnnConvolutionBwdDataAlgo_t, size_t*) { return VKDNN_STATUS_NOT_SUPPORTED; }
-vkdnnStatus_t vkdnnConvolutionBackwardData(vkdnnHandle_t, const void*, vkdnnFilterDescriptor_t, const void*, vkdnnTensorDescriptor_t, const void*, vkdnnConvolutionDescriptor_t, vkdnnConvolutionBwdDataAlgo_t, void*, size_t, const void*, vkdnnTensorDescriptor_t, void*) { return VKDNN_STATUS_NOT_SUPPORTED; }
-vkdnnStatus_t vkdnnGetConvolutionBackwardFilterWorkspaceSize(vkdnnHandle_t, vkdnnTensorDescriptor_t, vkdnnTensorDescriptor_t, vkdnnConvolutionDescriptor_t, vkdnnFilterDescriptor_t, vkdnnConvolutionBwdFilterAlgo_t, size_t*) { return VKDNN_STATUS_NOT_SUPPORTED; }
-vkdnnStatus_t vkdnnConvolutionBackwardFilter(vkdnnHandle_t, const void*, vkdnnTensorDescriptor_t, const void*, vkdnnTensorDescriptor_t, const void*, vkdnnConvolutionDescriptor_t, vkdnnConvolutionBwdFilterAlgo_t, void*, size_t, const void*, vkdnnFilterDescriptor_t, void*) { return VKDNN_STATUS_NOT_SUPPORTED; }
-vkdnnStatus_t vkdnnConvolutionBackwardBias(vkdnnHandle_t, const void*, vkdnnTensorDescriptor_t, const void*, const void*, vkdnnTensorDescriptor_t, void*) { return VKDNN_STATUS_NOT_SUPPORTED; }
-vkdnnStatus_t vkdnnPoolingBackward(vkdnnHandle_t, vkdnnPoolingDescriptor_t, const void*, vkdnnTensorDescriptor_t, const void*, vkdnnTensorDescriptor_t, const void*, vkdnnTensorDescriptor_t, const void*, const void*, vkdnnTensorDescriptor_t, void*) { return VKDNN_STATUS_NOT_SUPPORTED; }
-vkdnnStatus_t vkdnnSoftmaxBackward(vkdnnHandle_t, vkdnnSoftmaxAlgorithm_t, vkdnnSoftmaxMode_t, const void*, vkdnnTensorDescriptor_t, const void*, vkdnnTensorDescriptor_t, const void*, const void*, vkdnnTensorDescriptor_t, void*) { return VKDNN_STATUS_NOT_SUPPORTED; }
+// Implementations live with the descriptor registry in forward.cpp.

@@ -37,6 +37,8 @@ struct ConvolutionParams
     uint32_t ph, pw, sh, sw, dh, dw, groups, mode;
     uint32_t aOffset, bOffset, cOffset;
     float alpha, beta;
+    uint32_t op, n, nan;
+    float gamma, delta;
 };
 vkdnnError_t runtimeConvolution(int device, const void* x, size_t xBytes, const void* w, size_t wBytes,
-    void* y, size_t yBytes, ConvolutionParams params);
+    void* y, size_t yBytes, ConvolutionParams params, const void* extra = nullptr, size_t extraBytes = 0);

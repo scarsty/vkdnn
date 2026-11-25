@@ -217,7 +217,7 @@ vkdnnError_t runtimeHostScalar(const float* pointer, float& value)
 
 template <class Params, class Dispatch>
 vkdnnError_t runtimeProduct(int device, const void* a, size_t aBytes, const void* b, size_t bBytes,
-    void* c, size_t cBytes, Params params, Dispatch dispatch)
+    void* c, size_t cBytes, Params params, Dispatch dispatch, const void* extra = nullptr, size_t extraBytes = 0)
 {
     return guarded([&](Runtime& state)
         {
@@ -225,15 +225,16 @@ vkdnnError_t runtimeProduct(int device, const void* a, size_t aBytes, const void
             Pointer output = locate(state, c);
             if (!fits(output, cBytes) || output.offset % 4) { return vkdnnErrorInvalidValue; }
             if (output.allocation->device != device) { return vkdnnErrorInvalidDevice; }
-            Pointer inputs[2] = { output, output };
-            const void* addresses[2] = { a, b };
-            size_t sizes[2] = { aBytes, bBytes };
-            for (int i = 0; i < 2; ++i)
+            Pointer inputs[3] = { output, output, output };
+            const void* addresses[3] = { a, b, extra };
+            size_t sizes[3] = { aBytes, bBytes, extraBytes };
+            for (int i = 0; i < 3; ++i)
             {
                 if (!sizes[i]) { continue; }
                 inputs[i] = locate(state, addresses[i]);
                 if (!fits(inputs[i], sizes[i]) || inputs[i].offset % 4) { return vkdnnErrorInvalidValue; }
                 if (inputs[i].allocation->device != device) { return vkdnnErrorInvalidDevice; }
+                if ((inputs[i].offset + sizes[i]) / 4 > UINT32_MAX) { return vkdnnErrorNotSupported; }
                 if (inputs[i].allocation == output.allocation && inputs[i].offset < output.offset + cBytes
                     && output.offset < inputs[i].offset + sizes[i]) { return vkdnnErrorNotSupported; }
             }
@@ -255,9 +256,9 @@ vkdnnError_t runtimeGemm(int device, const void* a, size_t aBytes, const void* b
 }
 
 vkdnnError_t runtimeConvolution(int device, const void* x, size_t xBytes, const void* w, size_t wBytes,
-    void* y, size_t yBytes, ConvolutionParams params)
+    void* y, size_t yBytes, ConvolutionParams params, const void* extra, size_t extraBytes)
 {
-    return runtimeProduct(device, x, xBytes, w, wBytes, y, yBytes, params, convolutionBuffers);
+    return runtimeProduct(device, x, xBytes, w, wBytes, y, yBytes, params, convolutionBuffers, extra, extraBytes);
 }
 
 vkdnnError_t vkdnnGetDevice(int* device)

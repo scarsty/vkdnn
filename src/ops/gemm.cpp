@@ -61,6 +61,28 @@ vkblasStatus_t vkblasSetPointerMode(vkblasHandle_t handle, vkblasPointerMode_t m
     return VKBLAS_STATUS_SUCCESS;
 }
 
+vkblasStatus_t vkblasSscal(vkblasHandle_t handle, int n, const float* alpha, float* x, int incx)
+{
+    if (!handle) { return VKBLAS_STATUS_NOT_INITIALIZED; }
+    int device;
+    auto result = vkdnnGetDevice(&device);
+    if (result != vkdnnSuccess) { return status(result); }
+    if (device != handle->device) { return VKBLAS_STATUS_INVALID_VALUE; }
+    if (n <= 0 || incx <= 0) { return VKBLAS_STATUS_SUCCESS; }
+    GemmParams p{};
+    result = runtimeHostScalar(alpha, p.alpha);
+    if (result != vkdnnSuccess) { return status(result); }
+    uint64_t elements = uint64_t(n - 1) * uint64_t(incx) + 1;
+    if (elements > UINT32_MAX) { return VKBLAS_STATUS_NOT_SUPPORTED; }
+    // Reuse the GEMM registry, descriptors and dispatch without input buffers.
+    p.transa = 2;
+    p.transb = uint32_t(n);
+    p.lda = uint32_t(incx);
+    p.m = uint32_t(std::min(n, 65520));
+    p.n = (uint32_t(n) + p.m - 1) / p.m;
+    return status(runtimeGemm(device, nullptr, 0, nullptr, 0, x, size_t(elements * sizeof(float)), p));
+}
+
 vkblasStatus_t vkblasSgemm(vkblasHandle_t handle, vkblasOperation_t transa, vkblasOperation_t transb,
     int m, int n, int k, const float* alpha, const float* A, int lda,
     const float* B, int ldb, const float* beta, float* C, int ldc)

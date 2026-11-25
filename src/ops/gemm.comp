@@ -16,6 +16,16 @@ void main()
 {
     uint x = gl_LocalInvocationID.x, y = gl_LocalInvocationID.y;
     uint row = gl_GlobalInvocationID.x, col = gl_GlobalInvocationID.y;
+    if (p.transa == 2)
+    {
+        uint element = row + col * p.m;
+        if (row < p.m && col < p.n && element < p.transb)
+        {
+            uint index = p.cOffset + element * p.lda;
+            c[index] = p.alpha * c[index];
+        }
+        return;
+    }
     float sum = 0.0;
     for (uint base = 0; base < p.k; base += 16)
     {

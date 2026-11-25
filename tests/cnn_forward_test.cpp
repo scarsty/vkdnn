@@ -41,6 +41,261 @@ static void compare(const std::vector<float>& a, const std::vector<float>& b)
         }
     }
 }
+static void tensorAndSoftmax(vkdnnHandle_t handle)
+{
+    vkdnnTensorDescriptor_t t = nullptr, b = nullptr;
+    vkdnnOpTensorDescriptor_t op = nullptr;
+    OK(vkdnnCreateTensorDescriptor(&t));
+    OK(vkdnnCreateTensorDescriptor(&b));
+    OK(vkdnnCreateOpTensorDescriptor(&op));
+    OK(vkdnnSetTensor4dDescriptor(t, VKDNN_TENSOR_NCHW, VKDNN_DATA_FLOAT, 2, 3, 2, 2));
+    OK(vkdnnSetTensor4dDescriptor(b, VKDNN_TENSOR_NCHW, VKDNN_DATA_FLOAT, 1, 3, 1, 1));
+    constexpr int count = 24;
+    void *a = nullptr, *bp = nullptr, *c = nullptr, *grad = nullptr;
+    RT(vkdnnMalloc(&a, count * 4));
+    RT(vkdnnMalloc(&bp, count * 4));
+    RT(vkdnnMalloc(&c, count * 4));
+    RT(vkdnnMalloc(&grad, count * 4));
+    std::vector<float> input(count), dy(count), actual(count), expected(count);
+    for (int i = 0; i < count; ++i)
+    {
+        input[i] = float(i % 9 - 4) / 3;
+        dy[i] = float(i % 7 - 3) / 5;
+    }
+    float fill = -1.25f;
+    OK(vkdnnSetTensor(handle, t, c, &fill));
+    RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+    compare(actual, std::vector<float>(count, fill));
+    fill = std::numeric_limits<float>::quiet_NaN();
+    OK(vkdnnSetTensor(handle, t, c, &fill));
+    RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+    compare(actual, std::vector<float>(count, fill));
+    float alpha = 0.75f, second = -0.5f, beta = 0.25f, zero = 0, one = 1;
+    const float bias[] = { 1, 2, -3 };
+    RT(vkdnnMemcpy(a, input.data(), count * 4, vkdnnMemcpyHostToDevice));
+    RT(vkdnnMemcpy(bp, bias, sizeof(bias), vkdnnMemcpyHostToDevice));
+    for (int mode = 0; mode < 2; ++mode)
+    {
+        OK(vkdnnSetOpTensorDescriptor(op, vkdnnOpTensorOp_t(mode), VKDNN_DATA_FLOAT, VKDNN_PROPAGATE_NAN));
+        vkdnnOpTensorOp_t got;
+        vkdnnDataType_t type;
+        vkdnnNanPropagation_t nan;
+        OK(vkdnnGetOpTensorDescriptor(op, &got, &type, &nan));
+        REQUIRE(got == mode && type == VKDNN_DATA_FLOAT && nan == VKDNN_PROPAGATE_NAN);
+        fill = 2;
+        OK(vkdnnSetTensor(handle, t, c, &fill));
+        OK(vkdnnOpTensor(handle, op, &alpha, t, a, &second, b, bp, &beta, t, c));
+        for (int i = 0; i < count; ++i)
+        {
+            float av = alpha * input[i], bv = second * bias[(i / 4) % 3];
+            expected[i] = av + bv;
+            if (mode) { expected[i] = av * bv; }
+            expected[i] += beta * fill;
+        }
+        RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+        compare(actual, expected);
+        REQUIRE(vkdnnOpTensor(handle, op, &alpha, t, a, &second, b, bp, &zero, t, a) == VKDNN_STATUS_NOT_SUPPORTED);
+        REQUIRE(vkdnnOpTensor(handle, op, &alpha, t, a, &second, b, bp, &zero, t, static_cast<char*>(c) + 4) == VKDNN_STATUS_BAD_PARAM);
+        OK(vkdnnOpTensor(handle, op, &zero, t, nullptr, &zero, b, nullptr, &zero, t, c));
+        RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+        compare(actual, std::vector<float>(count, 0));
+    }
+    for (int nan = 0; nan < 2; ++nan)
+    {
+        auto values = input;
+        values[3] = std::numeric_limits<float>::quiet_NaN();
+        RT(vkdnnMemcpy(a, values.data(), count * 4, vkdnnMemcpyHostToDevice));
+        OK(vkdnnSetOpTensorDescriptor(op, VKDNN_OP_TENSOR_ADD, VKDNN_DATA_FLOAT, vkdnnNanPropagation_t(nan)));
+        OK(vkdnnOpTensor(handle, op, &one, t, a, &zero, b, nullptr, &zero, t, c));
+        RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+        if (!nan) { values[3] = 0; }
+        compare(actual, values);
+    }
+    RT(vkdnnMemcpy(a, input.data(), count * 4, vkdnnMemcpyHostToDevice));
+    RT(vkdnnMemcpy(grad, dy.data(), count * 4, vkdnnMemcpyHostToDevice));
+    for (int mode = 0; mode < 2; ++mode)
+    {
+        for (int algo = 0; algo < 3; ++algo)
+        {
+            auto algorithm = vkdnnSoftmaxAlgorithm_t(algo);
+            auto smode = vkdnnSoftmaxMode_t(mode);
+            OK(vkdnnSoftmaxForward(handle, algorithm, smode, &one, t, a, &zero, t, bp));
+            std::vector<float> y(count);
+            RT(vkdnnMemcpy(y.data(), bp, count * 4, vkdnnMemcpyDeviceToHost));
+            fill = 2;
+            OK(vkdnnSetTensor(handle, t, c, &fill));
+            OK(vkdnnSoftmaxBackward(handle, algorithm, smode, &alpha, t, bp, t, grad, &beta, t, c));
+            for (int i = 0; i < count; ++i)
+            {
+                int length = 12, stride = 1, base = (i / 12) * 12;
+                if (mode)
+                {
+                    length = 3;
+                    stride = 4;
+                    base = (i / 12) * 12 + i % 4;
+                }
+                float sum = 0;
+                for (int j = 0; j < length; ++j)
+                {
+                    int k = base + j * stride;
+                    if (algo == 2) { sum += dy[k]; }
+                    else
+                    {
+                        sum += y[k] * dy[k];
+                    }
+                }
+                float value = y[i] * (dy[i] - sum);
+                if (algo == 2) { value = dy[i] - std::exp(y[i]) * sum; }
+                expected[i] = alpha * value + beta * fill;
+            }
+            RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+            compare(actual, expected);
+            // Differentiate the actual GPU forward objective, not a second backward implementation.
+            constexpr float epsilon = 0.01f;
+            for (int sign : { -1, 1 })
+            {
+                input[5] += sign * epsilon;
+                RT(vkdnnMemcpy(a, input.data(), count * 4, vkdnnMemcpyHostToDevice));
+                OK(vkdnnSoftmaxForward(handle, algorithm, smode, &one, t, a, &zero, t, c));
+                RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+                double objective = 0;
+                for (int i = 0; i < count; ++i) { objective += actual[i] * dy[i]; }
+                if (sign < 0) { fill = float(objective); }
+                else
+                {
+                    float numerical = float((objective - fill) / (2 * epsilon));
+                    float reference = (expected[5] - beta * 2) / alpha;
+                    REQUIRE(std::abs(numerical - reference) < 0.002f);
+                }
+                input[5] -= sign * epsilon;
+            }
+            RT(vkdnnMemcpy(a, input.data(), count * 4, vkdnnMemcpyHostToDevice));
+            fill = std::numeric_limits<float>::quiet_NaN();
+            OK(vkdnnSetTensor(handle, t, c, &fill));
+            OK(vkdnnSoftmaxBackward(handle, algorithm, smode, &alpha, t, bp, t, grad, &zero, t, c));
+            RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+            for (float& value : expected) { value -= beta * 2; }
+            compare(actual, expected);
+            OK(vkdnnSoftmaxBackward(handle, algorithm, smode, &zero, t, nullptr, t, nullptr, &zero, t, c));
+            RT(vkdnnMemcpy(actual.data(), c, count * 4, vkdnnMemcpyDeviceToHost));
+            compare(actual, std::vector<float>(count, 0));
+            REQUIRE(vkdnnSoftmaxBackward(handle, algorithm, smode, &one, t, bp, t, grad, &zero, t, bp) == VKDNN_STATUS_NOT_SUPPORTED);
+        }
+    }
+    REQUIRE(vkdnnSetTensor(handle, t, c, c) == VKDNN_STATUS_BAD_PARAM);
+    OK(vkdnnDestroyOpTensorDescriptor(op));
+    REQUIRE(vkdnnDestroyOpTensorDescriptor(op) == VKDNN_STATUS_BAD_PARAM);
+    RT(vkdnnFree(a));
+    RT(vkdnnFree(bp));
+    RT(vkdnnFree(c));
+    RT(vkdnnFree(grad));
+    OK(vkdnnDestroyTensorDescriptor(t));
+    OK(vkdnnDestroyTensorDescriptor(b));
+    std::puts("PASS: SetTensor, OpTensor ADD/MUL broadcast/scalars/NaN/ranges, FAST/ACCURATE/LOG softmax backward CPU/GPU finite differences");
+}
+static void parallelForward(vkdnnHandle_t handle)
+{
+    vkdnnTensorDescriptor_t t = nullptr;
+    vkdnnActivationDescriptor_t activation = nullptr;
+    OK(vkdnnCreateTensorDescriptor(&t));
+    OK(vkdnnCreateActivationDescriptor(&activation));
+    for (int mode = 0; mode < 3; ++mode)
+    {
+        int n = 2, c = 4099, h = 1, w = 1;
+        if (mode == 1)
+        {
+            c = 131;
+            h = 3;
+            w = 23;
+        }
+        if (mode == 2)
+        {
+            n = 1;
+            c = 3;
+            h = 257;
+            w = 257;
+        }
+        OK(vkdnnSetTensor4dDescriptor(t, VKDNN_TENSOR_NCHW, VKDNN_DATA_FLOAT, n, c, h, w));
+        size_t count = size_t(n) * c * h * w;
+        std::vector<float> input(count), expected(count), actual(count), old(count, 0.5f);
+        for (size_t i = 0; i < count; ++i) { input[i] = float(int(i % 97) - 48) / 7; }
+        void *x = nullptr, *y = nullptr;
+        // Offset by one float, with a guard on both sides of the non-vector tail.
+        RT(vkdnnMalloc(&x, (count + 2) * 4));
+        RT(vkdnnMalloc(&y, (count + 2) * 4));
+        RT(vkdnnMemset(y, 0, (count + 2) * 4));
+        auto xp = static_cast<float*>(x) + 1;
+        auto yp = static_cast<float*>(y) + 1;
+        RT(vkdnnMemcpy(xp, input.data(), count * 4, vkdnnMemcpyHostToDevice));
+        float alpha = 0.75f, beta = 0.25f;
+        auto smode = VKDNN_SOFTMAX_MODE_INSTANCE;
+        if (mode != 0) { smode = VKDNN_SOFTMAX_MODE_CHANNEL; }
+        for (int algo = 0; algo < 3; ++algo)
+        {
+            RT(vkdnnMemcpy(yp, old.data(), count * 4, vkdnnMemcpyHostToDevice));
+            OK(vkdnnSoftmaxForward(handle, vkdnnSoftmaxAlgorithm_t(algo), smode, &alpha, t, xp, &beta, t, yp));
+            int spatial = h * w, length = c * spatial, stride = 1, groups = n;
+            if (mode != 0)
+            {
+                length = c;
+                stride = spatial;
+                groups = n * spatial;
+            }
+            for (int group = 0; group < groups; ++group)
+            {
+                int base = group * length;
+                if (mode != 0) { base = (group / spatial) * c * spatial + group % spatial; }
+                double maximum = -std::numeric_limits<double>::infinity(), sum = 0;
+                for (int j = 0; j < length; ++j) { maximum = std::max(maximum, double(input[base + j * stride])); }
+                for (int j = 0; j < length; ++j) { sum += std::exp(input[base + j * stride] - maximum); }
+                for (int j = 0; j < length; ++j)
+                {
+                    int k = base + j * stride;
+                    double value = std::exp(input[k] - maximum) / sum;
+                    if (algo == 2) { value = input[k] - maximum - std::log(sum); }
+                    expected[k] = float(alpha * value + beta * old[k]);
+                }
+            }
+            RT(vkdnnMemcpy(actual.data(), yp, count * 4, vkdnnMemcpyDeviceToHost));
+            compare(actual, expected);
+        }
+        for (int kind = 0; kind < 3; ++kind)
+        {
+            OK(vkdnnSetActivationDescriptor(activation, vkdnnActivationMode_t(kind), VKDNN_PROPAGATE_NAN, 0));
+            RT(vkdnnMemcpy(yp, old.data(), count * 4, vkdnnMemcpyHostToDevice));
+            OK(vkdnnActivationForward(handle, activation, &alpha, t, xp, &beta, t, yp));
+            for (size_t i = 0; i < count; ++i)
+            {
+                float value = 1 / (1 + std::exp(-input[i]));
+                if (kind == 1) { value = std::max(input[i], 0.f); }
+                if (kind == 2) { value = std::tanh(input[i]); }
+                expected[i] = alpha * value + beta * old[i];
+            }
+            RT(vkdnnMemcpy(actual.data(), yp, count * 4, vkdnnMemcpyDeviceToHost));
+            compare(actual, expected);
+        }
+        if (mode == 0)
+        {
+            // A nonfinite maximum or NaN poisons exactly its reduction group.
+            input[17] = std::numeric_limits<float>::quiet_NaN();
+            input[c + 65] = std::numeric_limits<float>::infinity();
+            RT(vkdnnMemcpy(xp, input.data(), count * 4, vkdnnMemcpyHostToDevice));
+            OK(vkdnnSoftmaxForward(handle, VKDNN_SOFTMAX_ACCURATE, smode, &alpha, t, xp, &beta, t, yp));
+            RT(vkdnnMemcpy(actual.data(), yp, count * 4, vkdnnMemcpyDeviceToHost));
+            compare(actual, std::vector<float>(count, std::numeric_limits<float>::quiet_NaN()));
+        }
+        float guard = 1;
+        RT(vkdnnMemcpy(&guard, y, 4, vkdnnMemcpyDeviceToHost));
+        REQUIRE(guard == 0);
+        RT(vkdnnMemcpy(&guard, static_cast<float*>(y) + count + 1, 4, vkdnnMemcpyDeviceToHost));
+        REQUIRE(guard == 0);
+        RT(vkdnnFree(x));
+        RT(vkdnnFree(y));
+    }
+    OK(vkdnnDestroyActivationDescriptor(activation));
+    OK(vkdnnDestroyTensorDescriptor(t));
+    std::puts("PASS: parallel large/tail/channel/2D-dispatch softmax and offset vec4 activation");
+}
 int main()
 {
     int count = 0;
@@ -59,6 +314,8 @@ int main()
     vkdnnActivationDescriptor_t activation = nullptr;
     vkdnnPoolingDescriptor_t pool = nullptr;
     OK(vkdnnCreate(&handle));
+    tensorAndSoftmax(handle);
+    parallelForward(handle);
     OK(vkdnnCreateTensorDescriptor(&xd));
     OK(vkdnnCreateTensorDescriptor(&yd));
     OK(vkdnnCreateActivationDescriptor(&activation));
@@ -461,7 +718,7 @@ int main()
             }
         }
     }
-    REQUIRE(vkdnnSoftmaxForward(handle, VKDNN_SOFTMAX_FAST, VKDNN_SOFTMAX_MODE_INSTANCE, &alpha, xd, xp, &beta, yd, yp) == VKDNN_STATUS_NOT_SUPPORTED);
+    OK(vkdnnSoftmaxForward(handle, VKDNN_SOFTMAX_FAST, VKDNN_SOFTMAX_MODE_INSTANCE, &alpha, xd, xp, &beta, yd, yp));
     for (float exceptional : { std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity() })
     {
         x.assign(size, exceptional);
@@ -515,6 +772,10 @@ int main()
     OK(vkdnnDestroy(handle));
     REQUIRE(vkdnnDestroy(handle) == VKDNN_STATUS_BAD_PARAM);
     REQUIRE(vkdnnDestroyTensorDescriptor(xd) == VKDNN_STATUS_BAD_PARAM);
+    RT(vkdnnDeviceReset());
+    OK(vkdnnCreate(&handle));
+    parallelForward(handle);
+    OK(vkdnnDestroy(handle));
     RT(vkdnnDeviceReset());
     std::puts("PASS: real Vulkan bias/broadcast/residual, ReLU/sigmoid/tanh/pooling/softmax, CPU references, alpha/beta, NaN, invalid inputs");
 }

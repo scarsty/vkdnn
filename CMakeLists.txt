@@ -31,6 +31,7 @@ add_custom_command(OUTPUT "${CONVOLUTION_SPV}"
     DEPENDS src/ops/convolution.comp VERBATIM)
 add_library(vkdnn SHARED src/core/vkdnn.cpp src/core/runtime.cpp src/ops/cnn_stubs.cpp src/ops/forward.cpp src/ops/gemm.cpp "${FORWARD_SPV}" "${GEMM_SPV}" "${CONVOLUTION_SPV}" "${BACKWARD_SPV}")
 target_include_directories(vkdnn PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_sources(vkdnn PRIVATE src/ops/convolution_query.cpp)
 target_compile_definitions(vkdnn PRIVATE VKDNN_BUILDING_LIBRARY)
 target_link_libraries(vkdnn PRIVATE Vulkan::Vulkan)
 target_include_directories(vkdnn PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")

@@ -37,6 +37,12 @@ struct vkdnnPoolingStruct
     vkdnnNanPropagation_t nan = VKDNN_NOT_PROPAGATE_NAN;
     uint32_t kh = 0, kw = 0, ph = 0, pw = 0, sh = 0, sw = 0;
 };
+struct vkdnnOpTensorStruct
+{
+    bool initialized = false;
+    vkdnnOpTensorOp_t op = VKDNN_OP_TENSOR_ADD;
+    vkdnnNanPropagation_t nan = VKDNN_NOT_PROPAGATE_NAN;
+};
 
 namespace
 {
@@ -47,6 +53,7 @@ std::unordered_set<vkdnnActivationDescriptor_t> activations;
 std::unordered_set<vkdnnPoolingDescriptor_t> pools;
 std::unordered_set<vkdnnFilterDescriptor_t> filters;
 std::unordered_set<vkdnnConvolutionDescriptor_t> convolutions;
+std::unordered_set<vkdnnOpTensorDescriptor_t> tensorOps;
 
 template <class F>
 vkdnnStatus_t guarded(F function)
@@ -130,12 +137,13 @@ vkdnnStatus_t execute(vkdnnHandle_t handle, const void* alpha, vkdnnTensorDescri
     p.oh = yd->h;
     p.ow = yd->w;
     p.outputC = yd->c;
-    if (p.op < 2 || p.op == 4)
+    if (p.op < 2 || p.op == 4 || p.op == 5)
     {
         p.count = yd->count;
     }
     else if (p.mode == VKDNN_SOFTMAX_MODE_INSTANCE)
     {
+        // Softmax count denotes independent reductions, not scalar output elements.
         p.count = xd->n;
     }
     else
@@ -143,6 +151,7 @@ vkdnnStatus_t execute(vkdnnHandle_t handle, const void* alpha, vkdnnTensorDescri
         p.count = xd->n * xd->h * xd->w;
     }
     size_t xBytes = size_t(xd->count) * 4;
+    if (p.op == 5) { xBytes = 0; }
     if ((p.op == 0 || p.op == 4) && p.alpha == 0) { xBytes = 0; }
     return mapStatus(runtimeCompute(handle->device, x, xBytes, y, size_t(yd->count) * 4, p));
 }
@@ -212,7 +221,158 @@ bool outputDim(vkdnnPoolingDescriptor_t p, vkdnnTensorDescriptor_t x, int& h, in
     w = int(ww);
     return true;
 }
+ConvolutionParams backwardParams(vkdnnTensorDescriptor_t x, vkdnnFilterDescriptor_t f,
+    vkdnnConvolutionDescriptor_t p, vkdnnTensorDescriptor_t y, uint32_t op)
+{
+    ConvolutionParams q{};
+    q.op = op;
+    q.n = x->n;
+    q.c = x->c;
+    q.h = x->h;
+    q.w = x->w;
+    q.k = f->k;
+    q.fc = f->c;
+    q.kh = f->h;
+    q.kw = f->w;
+    q.oh = y->h;
+    q.ow = y->w;
+    q.ph = p->ph;
+    q.pw = p->pw;
+    q.sh = p->sh;
+    q.sw = p->sw;
+    q.dh = p->dh;
+    q.dw = p->dw;
+    q.groups = p->groups;
+    q.mode = p->mode;
+    return q;
+}
+vkdnnStatus_t backwardExecute(vkdnnHandle_t handle, const void* alpha, const void* beta,
+    const void* a, size_t ab, const void* b, size_t bb, void* out, size_t bytes, ConvolutionParams q,
+    const void* extra = nullptr, size_t extraBytes = 0)
+{
+    auto s = runtimeHostScalar(static_cast<const float*>(alpha), q.alpha);
+    if (s != vkdnnSuccess) { return mapStatus(s); }
+    s = runtimeHostScalar(static_cast<const float*>(beta), q.beta);
+    if (s != vkdnnSuccess) { return mapStatus(s); }
+    if (q.alpha == 0)
+    {
+        ab = 0;
+        bb = 0;
+        extraBytes = 0;
+    }
+    return mapStatus(runtimeConvolution(handle->device, a, ab, b, bb, out, bytes, q, extra, extraBytes));
+}
 }    //namespace
+
+vkdnnStatus_t vkdnnGetConvolutionBackwardDataWorkspaceSize(vkdnnHandle_t handle, vkdnnFilterDescriptor_t f,
+    vkdnnTensorDescriptor_t y, vkdnnConvolutionDescriptor_t p, vkdnnTensorDescriptor_t x, vkdnnConvolutionBwdDataAlgo_t algo, size_t* bytes)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            auto s = convolutionOutput(p, x, f, y);
+            if (s != VKDNN_STATUS_SUCCESS) { return s; }
+            if (!bytes) { return VKDNN_STATUS_BAD_PARAM; }
+            if (algo != VKDNN_CONVOLUTION_BWD_DATA_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            *bytes = 0;
+            return VKDNN_STATUS_SUCCESS;
+        });
+}
+vkdnnStatus_t vkdnnGetConvolutionBackwardFilterWorkspaceSize(vkdnnHandle_t handle, vkdnnTensorDescriptor_t x,
+    vkdnnTensorDescriptor_t y, vkdnnConvolutionDescriptor_t p, vkdnnFilterDescriptor_t f, vkdnnConvolutionBwdFilterAlgo_t algo, size_t* bytes)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            auto s = convolutionOutput(p, x, f, y);
+            if (s != VKDNN_STATUS_SUCCESS) { return s; }
+            if (!bytes) { return VKDNN_STATUS_BAD_PARAM; }
+            if (algo != VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            *bytes = 0;
+            return VKDNN_STATUS_SUCCESS;
+        });
+}
+vkdnnStatus_t vkdnnConvolutionBackwardData(vkdnnHandle_t handle, const void* alpha, vkdnnFilterDescriptor_t f, const void* weights,
+    vkdnnTensorDescriptor_t y, const void* dy, vkdnnConvolutionDescriptor_t p, vkdnnConvolutionBwdDataAlgo_t algo,
+    void* workspace, size_t workspaceBytes, const void* beta, vkdnnTensorDescriptor_t x, void* dx)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            auto s = convolutionOutput(p, x, f, y);
+            if (s != VKDNN_STATUS_SUCCESS) { return s; }
+            if (algo != VKDNN_CONVOLUTION_BWD_DATA_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            (void)workspace;
+            (void)workspaceBytes;
+            auto q = backwardParams(x, f, p, y, 1);
+            q.count = x->count;
+            return backwardExecute(handle, alpha, beta, weights, size_t(f->count) * 4, dy, size_t(y->count) * 4, dx, size_t(x->count) * 4, q);
+        });
+}
+vkdnnStatus_t vkdnnConvolutionBackwardFilter(vkdnnHandle_t handle, const void* alpha, vkdnnTensorDescriptor_t x, const void* input,
+    vkdnnTensorDescriptor_t y, const void* dy, vkdnnConvolutionDescriptor_t p, vkdnnConvolutionBwdFilterAlgo_t algo,
+    void* workspace, size_t workspaceBytes, const void* beta, vkdnnFilterDescriptor_t f, void* dw)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            auto s = convolutionOutput(p, x, f, y);
+            if (s != VKDNN_STATUS_SUCCESS) { return s; }
+            if (algo != VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            (void)workspace;
+            (void)workspaceBytes;
+            auto q = backwardParams(x, f, p, y, 2);
+            q.count = f->count;
+            return backwardExecute(handle, alpha, beta, input, size_t(x->count) * 4, dy, size_t(y->count) * 4, dw, size_t(f->count) * 4, q);
+        });
+}
+vkdnnStatus_t vkdnnConvolutionBackwardBias(vkdnnHandle_t handle, const void* alpha, vkdnnTensorDescriptor_t y,
+    const void* dy, const void* beta, vkdnnTensorDescriptor_t b, void* db)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            if (!tensor(y) || !tensor(b) || b->n != 1 || b->h != 1 || b->w != 1 || b->c != y->c) { return VKDNN_STATUS_BAD_PARAM; }
+            ConvolutionParams q{};
+            q.op = 3;
+            q.count = b->count;
+            q.n = y->n;
+            q.k = y->c;
+            q.oh = y->h;
+            q.ow = y->w;
+            return backwardExecute(handle, alpha, beta, dy, size_t(y->count) * 4, nullptr, 0, db, size_t(b->count) * 4, q);
+        });
+}
+vkdnnStatus_t vkdnnPoolingBackward(vkdnnHandle_t handle, vkdnnPoolingDescriptor_t p, const void* alpha,
+    vkdnnTensorDescriptor_t y, const void* output, vkdnnTensorDescriptor_t dyd, const void* dy,
+    vkdnnTensorDescriptor_t x, const void* input, const void* beta, vkdnnTensorDescriptor_t dxd, void* dx)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            if (!pools.count(p) || !p->initialized || !tensor(x) || !tensor(y) || !tensor(dyd) || !tensor(dxd)
+                || !equal(y, dyd) || !equal(x, dxd)) { return VKDNN_STATUS_BAD_PARAM; }
+            int h, w;
+            if (!outputDim(p, x, h, w) || y->n != x->n || y->c != x->c || y->h != uint32_t(h) || y->w != uint32_t(w)) { return VKDNN_STATUS_BAD_PARAM; }
+            ConvolutionParams q{};
+            q.op = 4;
+            q.count = x->count;
+            q.h = x->h;
+            q.w = x->w;
+            q.oh = y->h;
+            q.ow = y->w;
+            q.kh = p->kh;
+            q.kw = p->kw;
+            q.ph = p->ph;
+            q.pw = p->pw;
+            q.sh = p->sh;
+            q.sw = p->sw;
+            q.mode = p->mode;
+            q.nan = p->nan;
+            // Recompute the winner from x; y still participates in ownership/range/alias validation.
+            return backwardExecute(handle, alpha, beta, input, size_t(x->count) * 4, dy, size_t(y->count) * 4, dx, size_t(x->count) * 4, q, output, size_t(y->count) * 4);
+        });
+}
 
 vkdnnStatus_t vkdnnCreate(vkdnnHandle_t* h)
 {
@@ -435,6 +595,15 @@ vkdnnStatus_t vkdnnSetConvolutionGroupCount(vkdnnConvolutionDescriptor_t p, int 
             return VKDNN_STATUS_SUCCESS;
         });
 }
+vkdnnStatus_t vkdnnSetConvolutionMathType(vkdnnConvolutionDescriptor_t p, vkdnnMathType_t type)
+{
+    return guarded([&]
+        {
+            if (!convolutions.count(p)) { return VKDNN_STATUS_BAD_PARAM; }
+            if (type != VKDNN_DEFAULT_MATH) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            return VKDNN_STATUS_SUCCESS;
+        });
+}
 vkdnnStatus_t vkdnnGetConvolution2dForwardOutputDim(vkdnnConvolutionDescriptor_t p, vkdnnTensorDescriptor_t x,
     vkdnnFilterDescriptor_t f, int* n, int* c, int* h, int* w)
 {
@@ -603,7 +772,7 @@ vkdnnStatus_t vkdnnSoftmaxForward(vkdnnHandle_t handle, vkdnnSoftmaxAlgorithm_t 
 {
     return guarded([&]
         {
-            if (algo != VKDNN_SOFTMAX_ACCURATE && algo != VKDNN_SOFTMAX_LOG)
+            if (algo != VKDNN_SOFTMAX_FAST && algo != VKDNN_SOFTMAX_ACCURATE && algo != VKDNN_SOFTMAX_LOG)
             {
                 return VKDNN_STATUS_NOT_SUPPORTED;
             }
@@ -617,11 +786,132 @@ vkdnnStatus_t vkdnnSoftmaxForward(vkdnnHandle_t handle, vkdnnSoftmaxAlgorithm_t 
             }
             ComputeParams p{};
             p.op = 2;
-            if (algo == VKDNN_SOFTMAX_LOG)
-            {
-                p.op = 3;
-            }
+            if (algo == VKDNN_SOFTMAX_LOG) { p.op = 3; }
             p.mode = mode;
             return execute(handle, alpha, xd, x, beta, yd, y, p);
+        });
+}
+vkdnnStatus_t vkdnnSetTensor(vkdnnHandle_t handle, vkdnnTensorDescriptor_t yd, void* y, const void* value)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            if (!tensor(yd)) { return VKDNN_STATUS_BAD_PARAM; }
+            ComputeParams p{};
+            p.op = 5;
+            float zero = 0;
+            return execute(handle, value, yd, nullptr, &zero, yd, y, p);
+        });
+}
+vkdnnStatus_t vkdnnCreateOpTensorDescriptor(vkdnnOpTensorDescriptor_t* d)
+{
+    return guarded([&]
+        {
+            return create(d, tensorOps);
+        });
+}
+vkdnnStatus_t vkdnnDestroyOpTensorDescriptor(vkdnnOpTensorDescriptor_t d)
+{
+    return guarded([&]
+        {
+            return destroy(d, tensorOps);
+        });
+}
+vkdnnStatus_t vkdnnSetOpTensorDescriptor(vkdnnOpTensorDescriptor_t d, vkdnnOpTensorOp_t op,
+    vkdnnDataType_t type, vkdnnNanPropagation_t nan)
+{
+    return guarded([&]
+        {
+            if (!tensorOps.count(d) || !nanOption(nan)) { return VKDNN_STATUS_BAD_PARAM; }
+            if (type != VKDNN_DATA_FLOAT || (op != VKDNN_OP_TENSOR_ADD && op != VKDNN_OP_TENSOR_MUL))
+            {
+                return VKDNN_STATUS_NOT_SUPPORTED;
+            }
+            *d = { true, op, nan };
+            return VKDNN_STATUS_SUCCESS;
+        });
+}
+vkdnnStatus_t vkdnnGetOpTensorDescriptor(vkdnnOpTensorDescriptor_t d, vkdnnOpTensorOp_t* op,
+    vkdnnDataType_t* type, vkdnnNanPropagation_t* nan)
+{
+    return guarded([&]
+        {
+            if (!tensorOps.count(d) || !d->initialized || !op || !type || !nan) { return VKDNN_STATUS_BAD_PARAM; }
+            *op = d->op;
+            *type = VKDNN_DATA_FLOAT;
+            *nan = d->nan;
+            return VKDNN_STATUS_SUCCESS;
+        });
+}
+vkdnnStatus_t vkdnnOpTensor(vkdnnHandle_t handle, vkdnnOpTensorDescriptor_t d,
+    const void* alpha1, vkdnnTensorDescriptor_t a, const void* ap,
+    const void* alpha2, vkdnnTensorDescriptor_t b, const void* bp,
+    const void* beta, vkdnnTensorDescriptor_t c, void* cp)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            if (!tensorOps.count(d) || !d->initialized || !tensor(a) || !tensor(b) || !tensor(c)
+                || !equal(a, c) || (b->n != 1 && b->n != c->n) || (b->c != 1 && b->c != c->c)
+                || (b->h != 1 && b->h != c->h) || (b->w != 1 && b->w != c->w))
+            {
+                return VKDNN_STATUS_BAD_PARAM;
+            }
+            ConvolutionParams p{};
+            auto s = runtimeHostScalar(static_cast<const float*>(alpha1), p.gamma);
+            if (s != vkdnnSuccess) { return mapStatus(s); }
+            s = runtimeHostScalar(static_cast<const float*>(alpha2), p.delta);
+            if (s != vkdnnSuccess) { return mapStatus(s); }
+            s = runtimeHostScalar(static_cast<const float*>(beta), p.beta);
+            if (s != vkdnnSuccess) { return mapStatus(s); }
+            p.alpha = 1;
+            p.op = 5;
+            p.mode = d->op;
+            p.nan = d->nan;
+            p.count = c->count;
+            p.n = b->n;
+            p.c = b->c;
+            p.h = b->h;
+            p.w = b->w;
+            p.k = c->c;
+            p.oh = c->h;
+            p.ow = c->w;
+            return mapStatus(runtimeConvolution(handle->device, ap, p.gamma == 0 ? 0 : size_t(a->count) * 4,
+                bp, p.delta == 0 ? 0 : size_t(b->count) * 4, cp, size_t(c->count) * 4, p));
+        });
+}
+vkdnnStatus_t vkdnnSoftmaxBackward(vkdnnHandle_t handle, vkdnnSoftmaxAlgorithm_t algo, vkdnnSoftmaxMode_t mode,
+    const void* alpha, vkdnnTensorDescriptor_t yd, const void* y, vkdnnTensorDescriptor_t dyDesc, const void* dy,
+    const void* beta, vkdnnTensorDescriptor_t dxDesc, void* dx)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            if (algo != VKDNN_SOFTMAX_FAST && algo != VKDNN_SOFTMAX_ACCURATE && algo != VKDNN_SOFTMAX_LOG)
+            {
+                return VKDNN_STATUS_NOT_SUPPORTED;
+            }
+            if (mode != VKDNN_SOFTMAX_MODE_INSTANCE && mode != VKDNN_SOFTMAX_MODE_CHANNEL)
+            {
+                return VKDNN_STATUS_NOT_SUPPORTED;
+            }
+            if (!tensor(yd) || !tensor(dyDesc) || !tensor(dxDesc) || !equal(yd, dyDesc) || !equal(yd, dxDesc))
+            {
+                return VKDNN_STATUS_BAD_PARAM;
+            }
+            ConvolutionParams p{};
+            auto s = runtimeHostScalar(static_cast<const float*>(alpha), p.alpha);
+            if (s != vkdnnSuccess) { return mapStatus(s); }
+            s = runtimeHostScalar(static_cast<const float*>(beta), p.beta);
+            if (s != vkdnnSuccess) { return mapStatus(s); }
+            p.op = 6;
+            p.mode = mode;
+            p.nan = algo;
+            p.count = yd->count;
+            p.c = yd->c;
+            p.h = yd->h;
+            p.w = yd->w;
+            size_t bytes = p.alpha == 0 ? 0 : size_t(yd->count) * 4;
+            return mapStatus(runtimeConvolution(handle->device, y, bytes, dy, bytes, dx, size_t(dxDesc->count) * 4, p));
         });
 }
