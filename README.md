@@ -6,6 +6,10 @@
 
 ## 项目定位
 
+BLAS 新增 `vkblasSasum`、`vkblasSdot`：连续或正步长 FP32 设备向量在 Vulkan compute 上归约，支持分配内偏移视图，仅回传最终 FP32 标量。当前使用单工作组共享内存归约，尚未针对大型向量优化；不做整向量 CPU 回退。
+
+`include/vkdnn/vkdnn_helpers.h` 提供独立 C ABI 便捷扩展 `vkdnnExecuteActivation`、`vkdnnExecutePooling` 和 `vkdnnExecuteConvolution`，并非 cuDNN 对应 API。调用方传入原生 DNN 句柄、连续 FP32 NCHW 的 `vkdnnTensorView`（维度、数据与可选梯度指针）及库枚举；库内管理描述符和临时设备输出。计算遵循 `alpha * result + beta * old_destination`，支持输入输出别名，成功后才复制回目标。反向需要有效梯度指针，卷积方向使用具名枚举；池化与卷积仅支持二维。调用前须将当前设备设为句柄所属设备；接口返回 DNN 状态，不泄漏 C++ 异常，不依赖 cccc。
+
 - **计算基础库，而非训练框架**：负责设备、内存、数据传输、矩阵计算和神经网络算子，不提供自动微分、优化器或模型导入。
 - **Vulkan 原生实现**：使用 Vulkan Compute 与 SPIR-V，不依赖 CUDA；不承诺 CUDA API、ABI 或执行语义兼容。
 - **正确性优先，性能逐步演进**：先建立 CPU 参考结果与可重复测试，再优化 shader、算子选择和执行开销。
@@ -20,6 +24,8 @@
 已在 [third_party/ncnn](third_party/ncnn/README.md) 保存固定版本参考快照，保留上游 BSD-3-Clause 许可；不参与构建。`src/ops/forward.comp` 和宿主调度为独立实现，构建期使用 Vulkan SDK `glslc` 生成嵌入式 SPIR-V，运行时无需 shader 文件或编译器。
 
 前向现采用 context 所属 pipeline/descriptor 复用、vec4 激活运算和 workgroup 并行 Softmax；RTX 5090 暖调用对比、验证与限制见 [前向性能记录](docs/FORWARD_PERFORMANCE.md)。这不是与 ncnn 的性能比较，也不是端到端训练验证。
+
+反向现复用同一缓存，SoftmaxBackward 使用每组共享归约，ActivationBackward 使用 vec4/标量尾部；平均池化反向局部消除重复扫描，卷积反向仍为确定性 gather。RTX 5090 同 DLL 基线对比与验证见 [反向性能记录](docs/BACKWARD_PERFORMANCE.md)。
 
 以下均为规划内容，具体支持范围以未来发布版本为准。
 

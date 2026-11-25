@@ -29,5 +29,6 @@ vkdnnStatus_t setMemory(vkdnnHandle_t, vkdnnMemory_t, size_t, int, size_t);
 vkdnnError_t computeBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, const ComputeParams&);
 vkdnnError_t activationBackwardBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ActivationBackwardParams&);
 vkdnnError_t gemmBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const GemmParams&);
+vkdnnError_t reduceBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, float*, const GemmParams&);
 vkdnnError_t convolutionBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ConvolutionParams&);
 }    //namespace vkdnnRuntime

@@ -217,7 +217,7 @@ vkdnnError_t runtimeHostScalar(const float* pointer, float& value)
 
 template <class Params, class Dispatch>
 vkdnnError_t runtimeProduct(int device, const void* a, size_t aBytes, const void* b, size_t bBytes,
-    void* c, size_t cBytes, Params params, Dispatch dispatch, const void* extra = nullptr, size_t extraBytes = 0)
+    void* c, size_t cBytes, Params params, Dispatch dispatch, const void* extra = nullptr, size_t extraBytes = 0, bool exactAlias = false)
 {
     return guarded([&](Runtime& state)
         {
@@ -235,6 +235,8 @@ vkdnnError_t runtimeProduct(int device, const void* a, size_t aBytes, const void
                 if (!fits(inputs[i], sizes[i]) || inputs[i].offset % 4) { return vkdnnErrorInvalidValue; }
                 if (inputs[i].allocation->device != device) { return vkdnnErrorInvalidDevice; }
                 if ((inputs[i].offset + sizes[i]) / 4 > UINT32_MAX) { return vkdnnErrorNotSupported; }
+                if (exactAlias && i < 2 && inputs[i].allocation == output.allocation
+                    && inputs[i].offset == output.offset && sizes[i] == cBytes) { continue; }
                 if (inputs[i].allocation == output.allocation && inputs[i].offset < output.offset + cBytes
                     && output.offset < inputs[i].offset + sizes[i]) { return vkdnnErrorNotSupported; }
             }
@@ -255,10 +257,37 @@ vkdnnError_t runtimeGemm(int device, const void* a, size_t aBytes, const void* b
     return runtimeProduct(device, a, aBytes, b, bBytes, c, cBytes, params, gemmBuffers);
 }
 
+vkdnnError_t runtimeReduce(int device, const void* x, size_t xBytes, const void* y, size_t yBytes,
+    float* result, GemmParams params)
+{
+    return guarded([&](Runtime& state)
+        {
+            if (device != currentDevice) { return vkdnnErrorInvalidDevice; }
+            if (!result || locate(state, result).allocation) { return vkdnnErrorInvalidValue; }
+            auto first = locate(state, x);
+            auto second = first;
+            if (yBytes) { second = locate(state, y); }
+            if (!fits(first, xBytes) || !fits(second, yBytes) || first.offset % 4 || second.offset % 4)
+            {
+                return vkdnnErrorInvalidValue;
+            }
+            if (first.allocation->device != device || second.allocation->device != device) { return vkdnnErrorInvalidDevice; }
+            if ((first.offset + xBytes) / 4 > UINT32_MAX || (second.offset + yBytes) / 4 > UINT32_MAX)
+            {
+                return vkdnnErrorNotSupported;
+            }
+            params.aOffset = static_cast<uint32_t>(first.offset / 4);
+            params.bOffset = static_cast<uint32_t>(second.offset / 4);
+            return reduceBuffers(first.allocation->context, first.allocation->memory, second.allocation->memory, result, params);
+        });
+}
+
 vkdnnError_t runtimeConvolution(int device, const void* x, size_t xBytes, const void* w, size_t wBytes,
     void* y, size_t yBytes, ConvolutionParams params, const void* extra, size_t extraBytes)
 {
-    return runtimeProduct(device, x, xBytes, w, wBytes, y, yBytes, params, convolutionBuffers, extra, extraBytes);
+    bool exactAlias = params.op == 5 && params.w == params.ow && params.h == params.oh
+        && params.c == params.k;
+    return runtimeProduct(device, x, xBytes, w, wBytes, y, yBytes, params, convolutionBuffers, extra, extraBytes, exactAlias);
 }
 
 vkdnnError_t vkdnnGetDevice(int* device)

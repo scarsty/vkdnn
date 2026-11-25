@@ -259,6 +259,66 @@ static void parallelForward(vkdnnHandle_t handle)
             RT(vkdnnMemcpy(actual.data(), yp, count * 4, vkdnnMemcpyDeviceToHost));
             compare(actual, expected);
         }
+        void *gradientAllocation = nullptr, *outputAllocation = nullptr;
+        RT(vkdnnMalloc(&gradientAllocation, (count + 2) * 4));
+        RT(vkdnnMalloc(&outputAllocation, (count + 2) * 4));
+        auto gp = static_cast<float*>(gradientAllocation) + 1;
+        auto op = static_cast<float*>(outputAllocation) + 1;
+        RT(vkdnnMemset(outputAllocation, 0, (count + 2) * 4));
+        std::vector<float> gradient(count), probabilities(count);
+        for (size_t i = 0; i < count; ++i) { gradient[i] = float(int(i % 29) - 14) / 19; }
+        RT(vkdnnMemcpy(gp, gradient.data(), count * 4, vkdnnMemcpyHostToDevice));
+        for (int algo = 0; algo < 3; ++algo)
+        {
+            float one = 1, zero = 0;
+            OK(vkdnnSoftmaxForward(handle, vkdnnSoftmaxAlgorithm_t(algo), smode, &one, t, xp, &zero, t, yp));
+            RT(vkdnnMemcpy(probabilities.data(), yp, count * 4, vkdnnMemcpyDeviceToHost));
+            for (float b : { 0.f, 0.25f })
+            {
+                std::vector<float> prior(count, 0.5f);
+                if (b == 0) { std::fill(prior.begin(), prior.end(), std::numeric_limits<float>::quiet_NaN()); }
+                RT(vkdnnMemcpy(op, prior.data(), count * 4, vkdnnMemcpyHostToDevice));
+                OK(vkdnnSoftmaxBackward(handle, vkdnnSoftmaxAlgorithm_t(algo), smode, &alpha, t, yp, t, gp, &b, t, op));
+                int spatial = h * w, length = c * spatial, stride = 1, groups = n;
+                if (mode != 0)
+                {
+                    length = c;
+                    stride = spatial;
+                    groups *= spatial;
+                }
+                for (int group = 0; group < groups; ++group)
+                {
+                    int base = group * length;
+                    if (mode != 0) { base = group / spatial * c * spatial + group % spatial; }
+                    double sum = 0;
+                    for (int j = 0; j < length; ++j)
+                    {
+                        int i = base + j * stride;
+                        if (algo == 2) { sum += gradient[i]; }
+                        else
+                        {
+                            sum += double(probabilities[i]) * gradient[i];
+                        }
+                    }
+                    for (int j = 0; j < length; ++j)
+                    {
+                        int i = base + j * stride;
+                        double value = double(probabilities[i]) * (gradient[i] - sum);
+                        if (algo == 2) { value = gradient[i] - std::exp(double(probabilities[i])) * sum; }
+                        expected[i] = float(alpha * value + b * 0.5);
+                    }
+                }
+                RT(vkdnnMemcpy(actual.data(), op, count * 4, vkdnnMemcpyDeviceToHost));
+                compare(actual, expected);
+            }
+        }
+        float backwardGuard = 1;
+        RT(vkdnnMemcpy(&backwardGuard, outputAllocation, 4, vkdnnMemcpyDeviceToHost));
+        REQUIRE(backwardGuard == 0);
+        RT(vkdnnMemcpy(&backwardGuard, static_cast<float*>(outputAllocation) + count + 1, 4, vkdnnMemcpyDeviceToHost));
+        REQUIRE(backwardGuard == 0);
+        RT(vkdnnFree(gradientAllocation));
+        RT(vkdnnFree(outputAllocation));
         for (int kind = 0; kind < 3; ++kind)
         {
             OK(vkdnnSetActivationDescriptor(activation, vkdnnActivationMode_t(kind), VKDNN_PROPAGATE_NAN, 0));

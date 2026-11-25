@@ -905,6 +905,7 @@ vkdnnStatus_t vkdnnSoftmaxBackward(vkdnnHandle_t handle, vkdnnSoftmaxAlgorithm_t
             s = runtimeHostScalar(static_cast<const float*>(beta), p.beta);
             if (s != vkdnnSuccess) { return mapStatus(s); }
             p.op = 6;
+            p.n = yd->n;
             p.mode = mode;
             p.nan = algo;
             p.count = yd->count;

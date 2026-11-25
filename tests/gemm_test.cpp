@@ -87,6 +87,41 @@ static void numerical(vkblasHandle_t handle, vkblasOperation_t ta, vkblasOperati
     RT(vkdnnFree(dc));
 }
 
+static void reductions(vkblasHandle_t handle)
+{
+    for (int count : { 1, 255, 256, 257, 65537 })
+    {
+        for (int stride : { 1, 3 })
+        {
+            std::vector<float> values(size_t(count) * stride + 3, -99);
+            double expectedSum = 0, expectedDot = 0;
+            for (int index = 0; index < count; ++index)
+            {
+                float value = float(index % 17 - 8) / 4;
+                values[3 + size_t(index) * stride] = value;
+                expectedSum += std::abs(value);
+                expectedDot += double(value) * value;
+            }
+            void* allocation = nullptr;
+            RT(vkdnnMalloc(&allocation, values.size() * sizeof(float)));
+            RT(vkdnnMemcpy(allocation, values.data(), values.size() * sizeof(float), vkdnnMemcpyHostToDevice));
+            auto view = static_cast<float*>(allocation) + 3;
+            float actual = -1;
+            OK(vkblasSasum(handle, count, view, stride, &actual));
+            REQUIRE(std::abs(actual - expectedSum) <= 1e-5 * std::max(1.0, expectedSum));
+            OK(vkblasSdot(handle, count, view, stride, view, stride, &actual));
+            REQUIRE(std::abs(actual - expectedDot) <= 1e-5 * std::max(1.0, expectedDot));
+            REQUIRE(vkblasSasum(handle, count, nullptr, stride, &actual) == VKBLAS_STATUS_INVALID_VALUE);
+            REQUIRE(vkblasSdot(handle, count, view, stride, nullptr, stride, &actual) == VKBLAS_STATUS_INVALID_VALUE);
+            REQUIRE(vkblasSasum(handle, count, view, stride, nullptr) == VKBLAS_STATUS_INVALID_VALUE);
+            OK(vkblasSasum(handle, 0, nullptr, 1, &actual));
+            REQUIRE(actual == 0);
+            RT(vkdnnFree(allocation));
+        }
+    }
+    std::puts("Native Vulkan asum/dot reductions passed");
+}
+
 static void scaling(vkblasHandle_t handle)
 {
     for (int n : { 1, 19, 257, 65537 })
@@ -141,6 +176,7 @@ int main()
     REQUIRE(vkblasDestroy(nullptr) == VKBLAS_STATUS_NOT_INITIALIZED);
     REQUIRE(vkblasSetPointerMode(nullptr, VKBLAS_POINTER_MODE_HOST) == VKBLAS_STATUS_NOT_INITIALIZED);
     OK(vkblasCreate(&handle));
+    reductions(handle);
     REQUIRE(vkblasSscal(nullptr, 0, nullptr, nullptr, 1) == VKBLAS_STATUS_NOT_INITIALIZED);
     OK(vkblasSscal(handle, 0, nullptr, nullptr, 1));
     OK(vkblasSscal(handle, -1, nullptr, nullptr, 1));

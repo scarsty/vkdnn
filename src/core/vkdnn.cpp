@@ -66,6 +66,8 @@ struct vkdnnContext
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    vkdnnMemory staging;
+    vkdnnMemory reduction;
     int index = -1;
     std::unordered_set<vkdnnMemory_t> allocations;
     // Runtime calls serialize and wait for the fence before reusing descriptors.
@@ -77,6 +79,10 @@ struct vkdnnContext
         if (device)
         {
             compute.clear();
+            if (staging.buffer) { vkDestroyBuffer(device, staging.buffer, nullptr); }
+            if (staging.allocation) { vkFreeMemory(device, staging.allocation, nullptr); }
+            if (reduction.buffer) { vkDestroyBuffer(device, reduction.buffer, nullptr); }
+            if (reduction.allocation) { vkFreeMemory(device, reduction.allocation, nullptr); }
             if (fence) { vkDestroyFence(device, fence, nullptr); }
             if (pool) { vkDestroyCommandPool(device, pool, nullptr); }
             vkDestroyDevice(device, nullptr);
@@ -243,8 +249,9 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
     vkCmdPushConstants(context->command, r.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, paramSize, params);
     vkCmdDispatch(context->command, groups, groupsY, 1);
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
     result = vkEndCommandBuffer(context->command);
     if (result != VK_SUCCESS)
     {
@@ -270,7 +277,7 @@ vkdnnError_t vkdnnRuntime::activationBackwardBuffers(vkdnnHandle_t context, vkdn
     vkdnnMemory_t dy, vkdnnMemory_t dx, const ActivationBackwardParams& params)
 {
     vkdnnMemory_t buffers[] = { x, y, dy, dx };
-    return dispatchBuffers(context, buffers, 4, backwardSpirv, sizeof(backwardSpirv), &params, sizeof(params), (params.count + 63u) / 64u, 1);
+    return dispatchBuffers(context, buffers, 4, backwardSpirv, sizeof(backwardSpirv), &params, sizeof(params), (params.count + 255u) / 256u, 1);
 }
 
 vkdnnError_t vkdnnRuntime::computeBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t y, const ComputeParams& params)
@@ -297,7 +304,21 @@ vkdnnError_t vkdnnRuntime::computeBuffers(vkdnnHandle_t context, vkdnnMemory_t x
 vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t w, vkdnnMemory_t y, const ConvolutionParams& params)
 {
     vkdnnMemory_t buffers[] = { x, w, y };
-    return dispatchBuffers(context, buffers, 3, convolutionSpirv, sizeof(convolutionSpirv), &params, sizeof(params), (params.count + 63u) / 64u, 1);
+    uint32_t groups = (params.count + 63u) / 64u, groupsY = 1;
+    if (params.op == 6)
+    {
+        groups = params.n;
+        if (params.mode == 1) { groups *= params.h * params.w; }
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(context->physical, &properties);
+        uint32_t limit = properties.limits.maxComputeWorkGroupCount[0];
+        if (groups > limit)
+        {
+            groupsY = (groups - 1u) / limit + 1u;
+            groups = limit;
+        }
+    }
+    return dispatchBuffers(context, buffers, 3, convolutionSpirv, sizeof(convolutionSpirv), &params, sizeof(params), groups, groupsY);
 }
 
 vkdnnError_t vkdnnRuntime::gemmBuffers(vkdnnHandle_t context, vkdnnMemory_t a, vkdnnMemory_t b, vkdnnMemory_t c, const GemmParams& params)
@@ -486,7 +507,7 @@ vkdnnStatus_t allocateBuffer(vkdnnHandle_t handle, VkDeviceSize bytes,
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     info.size = bytes;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { info.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT; }
+    info.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult result = vkCreateBuffer(handle->device, &info, nullptr, &memory.buffer);
     if (result != VK_SUCCESS) { return resultStatus(result); }
@@ -573,15 +594,14 @@ vkdnnStatus_t transfer(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset
     if (!bytes) { return VKDNN_STATUS_SUCCESS; }
     VkDeviceSize start = offset & ~VkDeviceSize(3);
     VkDeviceSize end = (offset + bytes + VkDeviceSize(3)) & ~VkDeviceSize(3);
-    vkdnnMemory staging;
-    vkdnnStatus_t status = allocateBuffer(handle, end - start, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, staging);
-    if (status != VKDNN_STATUS_SUCCESS) { return status; }
-    struct Cleanup
+    auto& staging = handle->staging;
+    vkdnnStatus_t status = VKDNN_STATUS_SUCCESS;
+    if (staging.size < end - start)
     {
-        vkdnnHandle_t handle;
-        vkdnnMemory& memory;
-        ~Cleanup() { releaseBuffer(handle, memory); }
-    } cleanup{ handle, staging };
+        releaseBuffer(handle, staging);
+        status = allocateBuffer(handle, end - start, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, staging);
+        if (status != VKDNN_STATUS_SUCCESS) { return status; }
+    }
     if (!upload || start != offset || end != offset + bytes)
     {
         status = copyBuffer(handle, staging.buffer, 0, memory->buffer, start, end - start);
@@ -779,6 +799,29 @@ vkdnnStatus_t vkdnnRuntime::createContext(vkdnnHandle_t* handle, int device)
     {
         return VKDNN_STATUS_INTERNAL_ERROR;
     }
+}
+
+vkdnnError_t vkdnnRuntime::reduceBuffers(vkdnnHandle_t handle, vkdnnMemory_t first, vkdnnMemory_t second,
+    float* output, const GemmParams& params)
+{
+    auto& reduction = handle->reduction;
+    if (!reduction.buffer)
+    {
+        auto status = allocateBuffer(handle, sizeof(float), VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, reduction);
+        if (status != vkdnnSuccess) { return status; }
+    }
+    auto status = gemmBuffers(handle, first, second, &reduction, params);
+    if (status != vkdnnSuccess) { return status; }
+    void* mapped = nullptr;
+    auto result = vkMapMemory(handle->device, reduction.allocation, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (result != VK_SUCCESS) { return resultStatus(result); }
+    VkMappedMemoryRange range{ VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    range.memory = reduction.allocation;
+    range.size = VK_WHOLE_SIZE;
+    result = vkInvalidateMappedMemoryRanges(handle->device, 1, &range);
+    if (result == VK_SUCCESS) { std::memcpy(output, mapped, sizeof(float)); }
+    vkUnmapMemory(handle->device, reduction.allocation);
+    return resultStatus(result);
 }
 
 vkdnnStatus_t vkdnnRuntime::destroyContext(vkdnnHandle_t handle)

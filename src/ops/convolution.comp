@@ -13,6 +13,7 @@ layout(push_constant) uniform Params
     float gamma, delta;
 }
 p;
+shared float partial[64];
 bool nanBits(float v) { return (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u; }
 float product(float a, float b)
 {
@@ -42,30 +43,6 @@ float gradient(uint i)
         if (p.mode == 1) { return product(a, b); }
         return a + b;
     }
-    if (p.op == 6)
-    {
-        uint spatial = p.h * p.w, length = p.c * spatial, stride = 1;
-        uint base = (i / length) * length;
-        if (p.mode == 1)
-        {
-            length = p.c;
-            stride = spatial;
-            base = (i / (spatial * p.c)) * spatial * p.c + i % spatial;
-        }
-        for (uint j = 0; j < length; ++j)
-        {
-            float d = w[p.bOffset + base + j * stride];
-            if (p.nan == 2) { sum += d; }
-            else
-            {
-                sum += product(x[p.aOffset + base + j * stride], d);
-            }
-        }
-        float value = x[p.aOffset + i], dy = w[p.bOffset + i];
-        if (nanBits(sum) || nanBits(value) || nanBits(dy)) { return uintBitsToFloat(0x7fc00000u); }
-        if (p.nan == 2) { return dy - exp(value) * sum; }
-        return product(value, dy - sum);
-    }
     if (p.op == 3)
     {
         for (uint bn = 0; bn < p.n; ++bn)
@@ -88,6 +65,14 @@ float gradient(uint i)
             for (uint ox = firstX; ox < p.ow && ox <= (ix + p.pw) / p.sw; ++ox)
             {
                 int top = int(oy * p.sh) - int(p.ph), left = int(ox * p.sw) - int(p.pw);
+                if (p.mode != 0 && p.nan == 0)
+                {
+                    uint valid = uint(max(0, min(int(p.h), top + int(p.kh)) - max(0, top)))
+                        * uint(max(0, min(int(p.w), left + int(p.kw)) - max(0, left)));
+                    if (p.mode == 1) { valid = p.kh * p.kw; }
+                    if (!nanBits(x[p.aOffset + i])) { sum += w[p.bOffset + (nc * p.oh + oy) * p.ow + ox] / float(valid); }
+                    continue;
+                }
                 uint valid = 0, winner = 0xffffffffu;
                 float best = uintBitsToFloat(0xff800000u);
                 bool bad = false;
@@ -182,6 +167,56 @@ float gradient(uint i)
 }
 void main()
 {
+    if (p.op == 6)
+    {
+        uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+        uint spatial = p.h * p.w, length = p.c * spatial, stride = 1, groups = p.n;
+        uint base = group * length;
+        if (p.mode == 1)
+        {
+            length = p.c;
+            stride = spatial;
+            groups *= spatial;
+            base = (group / spatial) * p.c * spatial + group % spatial;
+        }
+        if (group >= groups) { return; }
+        uint lane = gl_LocalInvocationID.x;
+        float sum = 0.0;
+        if (p.alpha != 0.0)
+        {
+            for (uint j = lane; j < length; j += 64)
+            {
+                uint i = base + j * stride;
+                float d = w[p.bOffset + i];
+                if (p.nan != 2) { d = product(x[p.aOffset + i], d); }
+                sum += d;
+            }
+        }
+        partial[lane] = sum;
+        barrier();
+        for (uint step = 32; step > 0; step >>= 1)
+        {
+            if (lane < step) { partial[lane] += partial[lane + step]; }
+            barrier();
+        }
+        for (uint j = lane; j < length; j += 64)
+        {
+            uint i = base + j * stride;
+            float result = 0.0;
+            if (p.alpha != 0.0)
+            {
+                float value = x[p.aOffset + i], d = w[p.bOffset + i];
+                float g = product(value, d - partial[0]);
+                if (p.nan == 2) { g = d - exp(value) * partial[0]; }
+                result = product(p.alpha, g);
+                if (nanBits(value) || nanBits(d) || nanBits(partial[0])) { result = uintBitsToFloat(0x7fc00000u); }
+            }
+            if (p.beta != 0.0) { result += product(p.beta, y[p.cOffset + i]); }
+            if (nanBits(p.alpha) || nanBits(p.beta) || nanBits(result)) { result = uintBitsToFloat(0x7fc00000u); }
+            y[p.cOffset + i] = result;
+        }
+        return;
+    }
     uint i = gl_GlobalInvocationID.x;
     if (i >= p.count) { return; }
     float result = 0.0;

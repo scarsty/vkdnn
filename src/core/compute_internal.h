@@ -28,6 +28,8 @@ struct GemmParams
     float alpha, beta;
 };
 vkdnnError_t runtimeHostScalar(const float* pointer, float& value);
+vkdnnError_t runtimeReduce(int device, const void* x, size_t xBytes, const void* y, size_t yBytes,
+    float* result, GemmParams params);
 vkdnnError_t runtimeGemm(int device, const void* a, size_t aBytes, const void* b, size_t bBytes,
     void* c, size_t cBytes, GemmParams params);
 

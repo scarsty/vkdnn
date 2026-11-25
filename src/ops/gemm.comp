@@ -12,10 +12,34 @@ layout(push_constant) uniform Parameters
 p;
 shared float tileA[16][16];
 shared float tileB[16][16];
+shared float reduction[256];
 void main()
 {
     uint x = gl_LocalInvocationID.x, y = gl_LocalInvocationID.y;
     uint row = gl_GlobalInvocationID.x, col = gl_GlobalInvocationID.y;
+    if (p.transa == 3 || p.transa == 4)
+    {
+        uint lane = gl_LocalInvocationIndex;
+        float value = 0.0;
+        for (uint element = lane; element < p.k; element += 256)
+        {
+            float first = a[p.aOffset + element * p.lda];
+            if (p.transa == 3) { value += abs(first); }
+            else
+            {
+                value += first * b[p.bOffset + element * p.ldb];
+            }
+        }
+        reduction[lane] = value;
+        barrier();
+        for (uint offset = 128; offset > 0; offset /= 2)
+        {
+            if (lane < offset) { reduction[lane] += reduction[lane + offset]; }
+            barrier();
+        }
+        if (lane == 0) { c[p.cOffset] = reduction[0]; }
+        return;
+    }
     if (p.transa == 2)
     {
         uint element = row + col * p.m;

@@ -1,3 +1,4 @@
+#include "vkdnn/vkdnn_helpers.h"
 #include "vkdnn/vkdnn_ops.h"
 #include <algorithm>
 #include <cmath>
@@ -53,13 +54,37 @@ int main()
     vkdnnActivationDescriptor_t activation = nullptr, unsetActivation = nullptr;
     vkdnnTensorDescriptor_t tensor = nullptr, unset = nullptr, different = nullptr;
     OK(vkdnnCreate(&handle));
+    {
+        void* data = nullptr;
+        void* gradient = nullptr;
+        RT(vkdnnMalloc(&data, 2 * sizeof(float)));
+        RT(vkdnnMalloc(&gradient, 2 * sizeof(float)));
+        float values[2] = { -2, 3 };
+        float gradients[2] = { 4, 5 };
+        RT(vkdnnMemcpy(data, values, sizeof(values), vkdnnMemcpyHostToDevice));
+        RT(vkdnnMemcpy(gradient, gradients, sizeof(gradients), vkdnnMemcpyHostToDevice));
+        vkdnnTensorView view{ 1, 1, 1, 2, data, gradient };
+        OK(vkdnnExecuteActivation(handle, view, view, VKDNN_HELPER_RELU, 2, 1, 0));
+        RT(vkdnnMemcpy(values, data, sizeof(values), vkdnnMemcpyDeviceToHost));
+        compare(values[0], -2);
+        compare(values[1], 9);
+        OK(vkdnnExecuteActivation(handle, view, view, VKDNN_HELPER_RELU, 2, 1, 1));
+        RT(vkdnnMemcpy(gradients, gradient, sizeof(gradients), vkdnnMemcpyDeviceToHost));
+        compare(gradients[0], 4);
+        compare(gradients[1], 15);
+        REQUIRE(vkdnnExecuteActivation(handle, view, view, VKDNN_HELPER_RELU, 1, 0, 2) == VKDNN_STATUS_BAD_PARAM);
+        REQUIRE(vkdnnExecuteActivation(handle, view, view, static_cast<vkdnnActivationKind>(99), 1, 0, 0) == VKDNN_STATUS_NOT_SUPPORTED);
+        RT(vkdnnFree(gradient));
+        RT(vkdnnFree(data));
+        std::puts("Execution helpers aliasing, accumulation and invalid parameters passed");
+    }
     OK(vkdnnCreateActivationDescriptor(&activation));
     OK(vkdnnCreateActivationDescriptor(&unsetActivation));
     OK(vkdnnCreateTensorDescriptor(&tensor));
     OK(vkdnnCreateTensorDescriptor(&unset));
     OK(vkdnnCreateTensorDescriptor(&different));
     OK(vkdnnSetTensor4dDescriptor(different, VKDNN_TENSOR_NCHW, VKDNN_DATA_FLOAT, 1, 1, 1, 1));
-    constexpr int capacity = 258;
+    constexpr int capacity = 65541;
     void* allocation[4]{};
     void* pointer[4]{};
     for (int i = 0; i < 4; ++i)
@@ -75,7 +100,7 @@ int main()
     };
     std::mt19937 random(8321);
     std::uniform_real_distribution<float> distribution(-4, 4);
-    for (int size : { 1, 63, 64, 65, 256 })
+    for (int size : { 1, 63, 64, 65, 256, 65539 })
     {
         int batch = 1, width = size;
         if (size == 256)

@@ -83,6 +83,42 @@ vkblasStatus_t vkblasSscal(vkblasHandle_t handle, int n, const float* alpha, flo
     return status(runtimeGemm(device, nullptr, 0, nullptr, 0, x, size_t(elements * sizeof(float)), p));
 }
 
+static vkblasStatus_t reduceVector(vkblasHandle_t handle, int n, const float* x, int incx,
+    const float* y, int incy, float* result, bool absolute)
+{
+    if (!handle) { return VKBLAS_STATUS_NOT_INITIALIZED; }
+    int device = -1;
+    auto error = vkdnnGetDevice(&device);
+    if (error != vkdnnSuccess) { return status(error); }
+    if (device != handle->device || !result) { return VKBLAS_STATUS_INVALID_VALUE; }
+    if (n <= 0 || incx <= 0 || (!absolute && incy <= 0))
+    {
+        *result = 0;
+        return VKBLAS_STATUS_SUCCESS;
+    }
+    uint64_t xElements = uint64_t(n - 1) * uint64_t(incx) + 1;
+    uint64_t yElements = absolute ? 0 : uint64_t(n - 1) * uint64_t(incy) + 1;
+    if (xElements > UINT32_MAX || yElements > UINT32_MAX) { return VKBLAS_STATUS_NOT_SUPPORTED; }
+    GemmParams params{};
+    params.m = 1;
+    params.n = 1;
+    params.k = uint32_t(n);
+    params.lda = uint32_t(incx);
+    params.ldb = uint32_t(incy);
+    params.transa = absolute ? 3 : 4;
+    return status(runtimeReduce(device, x, size_t(xElements * sizeof(float)), y, size_t(yElements * sizeof(float)), result, params));
+}
+
+vkblasStatus_t vkblasSasum(vkblasHandle_t handle, int n, const float* x, int incx, float* result)
+{
+    return reduceVector(handle, n, x, incx, nullptr, 1, result, true);
+}
+
+vkblasStatus_t vkblasSdot(vkblasHandle_t handle, int n, const float* x, int incx, const float* y, int incy, float* result)
+{
+    return reduceVector(handle, n, x, incx, y, incy, result, false);
+}
+
 vkblasStatus_t vkblasSgemm(vkblasHandle_t handle, vkblasOperation_t transa, vkblasOperation_t transb,
     int m, int n, int k, const float* alpha, const float* A, int lda,
     const float* B, int ldb, const float* beta, float* C, int ldc)

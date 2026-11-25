@@ -45,6 +45,12 @@ VKDNN_API vkblasStatus_t vkblasSetPointerMode(vkblasHandle_t handle, vkblasPoint
  * aligned runtime allocation/view spanning (n-1)*incx+1 floats on that device.
  * Gaps are preserved; multiplication reads x even when alpha is zero. */
 VKDNN_API vkblasStatus_t vkblasSscal(vkblasHandle_t handle, int n, const float* alpha, float* x, int incx);
+/* Synchronous FP32 GPU reductions with a HOST result pointer, matching CUDA 13.2
+ * cuBLAS signatures. n<=0 or nonpositive increments write zero without reading
+ * inputs. Positive increments and aligned runtime views are supported. Only the
+ * final scalar is copied to HOST; inputs are never reduced on the CPU. */
+VKDNN_API vkblasStatus_t vkblasSasum(vkblasHandle_t handle, int n, const float* x, int incx, float* result);
+VKDNN_API vkblasStatus_t vkblasSdot(vkblasHandle_t handle, int n, const float* x, int incx, const float* y, int incy, float* result);
 VKDNN_API vkblasStatus_t vkblasSgemm(vkblasHandle_t handle, vkblasOperation_t transa, vkblasOperation_t transb,
     int m, int n, int k, const float* alpha, const float* A, int lda,
     const float* B, int ldb, const float* beta, float* C, int ldc);
