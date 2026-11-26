@@ -28,18 +28,20 @@ typedef enum vkblasPointerMode_t
     VKBLAS_POINTER_MODE_DEVICE = 1
 } vkblasPointerMode_t;
 /* cuBLAS-style column-major matrices; scalar pointer mode defaults to HOST.
- * Synchronous FP32 Vulkan GEMM; real OP_C is OP_T. Leading dimensions include padding.
+ * FP32 Vulkan GEMM; completion follows vkdnnSetExecutionMode (synchronous by default).
+ * Real OP_C is OP_T. Leading dimensions include padding.
  * DEVICE pointer mode returns NOT_SUPPORTED and leaves HOST mode unchanged.
  * Handles bind the current device. Caller serializes handle access/destruction.
  * Matrices must be runtime allocations (aligned offsets allowed); overlapping
  * input/output ranges are NOT_SUPPORTED. A/B are unused for alpha=0 or k=0;
  * beta=0 does not read C. m=0 or n=0 needs no pointers (dimensions still checked).
  * k=0 does not read alpha. Nonempty C must always be valid, even for beta=1.
- * Destroyed handles must not be reused. No batched or asynchronous API. */
+ * Destroyed handles must not be reused. No batched GEMM API. */
 VKDNN_API vkblasStatus_t vkblasCreate(vkblasHandle_t* handle);
 VKDNN_API vkblasStatus_t vkblasDestroy(vkblasHandle_t handle);
 VKDNN_API vkblasStatus_t vkblasSetPointerMode(vkblasHandle_t handle, vkblasPointerMode_t mode);
-/* Synchronous in-place FP32 scaling: x[i*incx] *= *alpha (0 <= i < n).
+/* In-place FP32 scaling: x[i*incx] *= *alpha (0 <= i < n).
+ * Completion follows vkdnnSetExecutionMode.
  * n<=0 or incx<=0 is a successful no-op without accessing alpha/x, after
  * handle/current-device validation. Otherwise alpha is HOST and x must be an
  * aligned runtime allocation/view spanning (n-1)*incx+1 floats on that device.

@@ -31,7 +31,8 @@
       <LanguageStandard>stdcpp17</LanguageStandard>
       <WarningLevel>Level3</WarningLevel>
       <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\include;$(IntDir)generated;$(VULKAN_SDK)\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>VKDNN_BUILDING_LIBRARY;WIN32;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>$(VkDnnExperimentDefinitions);VKDNN_BUILDING_LIBRARY;WIN32;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(VkDnnProfile)'=='true'">VKDNN_PROFILE;VKDNN_BUILDING_LIBRARY;WIN32;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization Condition="'$(Configuration)'=='Debug'">Disabled</Optimization>
       <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
@@ -67,7 +68,7 @@
     <Error Condition="!Exists('$(VULKAN_SDK)\Bin\glslc.exe')" Text="VULKAN_SDK must contain Bin\glslc.exe." />
   </Target>
   <Target Name="CompileComputeShaders" BeforeTargets="ClCompile"
-          Inputs="$(MSBuildThisFileDirectory)ops\forward.comp;$(MSBuildThisFileDirectory)ops\gemm.comp;$(MSBuildThisFileDirectory)ops\convolution.comp;$(MSBuildThisFileDirectory)ops\backward.comp"
+          Inputs="$(MSBuildProjectFullPath);$(MSBuildThisFileDirectory)ops\forward.comp;$(MSBuildThisFileDirectory)ops\gemm.comp;$(MSBuildThisFileDirectory)ops\convolution.comp;$(MSBuildThisFileDirectory)ops\backward.comp"
           Outputs="$(IntDir)generated\forward_spv.inc;$(IntDir)generated\gemm_spv.inc;$(IntDir)generated\convolution_spv.inc;$(IntDir)generated\backward_spv.inc">
     <MakeDir Directories="$(IntDir)generated" />
     <Exec Command="&quot;$(VULKAN_SDK)\Bin\glslc.exe&quot; --target-env=vulkan1.2 -mfmt=c &quot;$(MSBuildThisFileDirectory)ops\backward.comp&quot; -o &quot;$(IntDir)generated\backward_spv.inc&quot;" />

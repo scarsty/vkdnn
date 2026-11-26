@@ -1,3 +1,4 @@
+#include "profile_internal.h"
 #include "runtime_internal.h"
 
 #include <cstring>
@@ -149,6 +150,7 @@ vkdnnError_t vkdnnSetDevice(int device)
 
 vkdnnError_t runtimeCompute(int device, const void* x, size_t xBytes, void* y, size_t yBytes, ComputeParams params)
 {
+    VKDNN_PROFILE_SCOPE("api.compute." + std::to_string(params.op));
     return guarded([&](Runtime& state)
         {
             if (device != currentDevice) { return vkdnnErrorInvalidDevice; }
@@ -175,6 +177,7 @@ vkdnnError_t runtimeCompute(int device, const void* x, size_t xBytes, void* y, s
 vkdnnError_t runtimeActivationBackward(int device, const void* x, const void* y, const void* dy,
     void* dx, size_t bytes, ActivationBackwardParams params)
 {
+    VKDNN_PROFILE_SCOPE("api.activation_backward");
     return guarded([&](Runtime& state)
         {
             if (device != currentDevice) { return vkdnnErrorInvalidDevice; }
@@ -254,12 +257,14 @@ vkdnnError_t runtimeProduct(int device, const void* a, size_t aBytes, const void
 vkdnnError_t runtimeGemm(int device, const void* a, size_t aBytes, const void* b, size_t bBytes,
     void* c, size_t cBytes, GemmParams params)
 {
+    VKDNN_PROFILE_SCOPE("api.gemm.transa." + std::to_string(params.transa));
     return runtimeProduct(device, a, aBytes, b, bBytes, c, cBytes, params, gemmBuffers);
 }
 
 vkdnnError_t runtimeReduce(int device, const void* x, size_t xBytes, const void* y, size_t yBytes,
     float* result, GemmParams params)
 {
+    VKDNN_PROFILE_SCOPE("api.reduce");
     return guarded([&](Runtime& state)
         {
             if (device != currentDevice) { return vkdnnErrorInvalidDevice; }
@@ -285,6 +290,7 @@ vkdnnError_t runtimeReduce(int device, const void* x, size_t xBytes, const void*
 vkdnnError_t runtimeConvolution(int device, const void* x, size_t xBytes, const void* w, size_t wBytes,
     void* y, size_t yBytes, ConvolutionParams params, const void* extra, size_t extraBytes)
 {
+    VKDNN_PROFILE_SCOPE("api.convolution." + std::to_string(params.op));
     bool exactAlias = params.op == 5 && params.w == params.ow && params.h == params.oh
         && params.c == params.k;
     return runtimeProduct(device, x, xBytes, w, wBytes, y, yBytes, params, convolutionBuffers, extra, extraBytes, exactAlias);
@@ -301,8 +307,21 @@ vkdnnError_t vkdnnGetDevice(int* device)
         });
 }
 
+vkdnnError_t vkdnnSetExecutionMode(vkdnnExecutionMode mode)
+{
+    if (mode != vkdnnExecutionSynchronous && mode != vkdnnExecutionAsynchronous) { return vkdnnErrorInvalidValue; }
+    return guarded([&](Runtime& state)
+        {
+            vkdnnHandle_t context = nullptr;
+            auto status = contextFor(state, context);
+            if (status != vkdnnSuccess) { return status; }
+            return setExecutionMode(context, mode);
+        });
+}
+
 vkdnnError_t vkdnnDeviceSynchronize(void)
 {
+    VKDNN_PROFILE_SCOPE("api.synchronize");
     return guarded([](Runtime& state)
         {
             vkdnnHandle_t context = nullptr;
@@ -346,6 +365,7 @@ vkdnnError_t vkdnnDeviceReset(void)
 
 vkdnnError_t vkdnnMalloc(void** devPtr, size_t size)
 {
+    VKDNN_PROFILE_SCOPE("api.malloc");
     if (!devPtr || size > std::numeric_limits<size_t>::max() - 65536) { return vkdnnErrorInvalidValue; }
     if (!size)
     {
@@ -386,6 +406,7 @@ vkdnnError_t vkdnnMalloc(void** devPtr, size_t size)
 
 vkdnnError_t vkdnnFree(void* devPtr)
 {
+    VKDNN_PROFILE_SCOPE("api.free");
     if (!devPtr) { return vkdnnSuccess; }
     return guarded([&](Runtime& state)
         {
@@ -400,6 +421,7 @@ vkdnnError_t vkdnnFree(void* devPtr)
 
 vkdnnError_t vkdnnMemcpy(void* dst, const void* src, size_t count, enum vkdnnMemcpyKind kind)
 {
+    VKDNN_PROFILE_SCOPE("api.memcpy." + std::to_string(kind));
     if (kind < vkdnnMemcpyHostToHost || kind > vkdnnMemcpyDefault) { return vkdnnErrorInvalidMemcpyDirection; }
     if (!count) { return vkdnnSuccess; }
     if (!dst || !src) { return vkdnnErrorInvalidValue; }
@@ -446,6 +468,7 @@ vkdnnError_t vkdnnMemcpy(void* dst, const void* src, size_t count, enum vkdnnMem
 
 vkdnnError_t vkdnnMemset(void* devPtr, int value, size_t count)
 {
+    VKDNN_PROFILE_SCOPE("api.memset");
     if (!count) { return vkdnnSuccess; }
     if (!devPtr) { return vkdnnErrorInvalidValue; }
     return guarded([&](Runtime& state)

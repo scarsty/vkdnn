@@ -20,6 +20,7 @@ constexpr auto VKDNN_STATUS_INTERNAL_ERROR = vkdnnErrorUnknown;
 vkdnnStatus_t createContext(vkdnnHandle_t*, int);
 vkdnnStatus_t destroyContext(vkdnnHandle_t);
 vkdnnStatus_t synchronizeContext(vkdnnHandle_t);
+vkdnnError_t setExecutionMode(vkdnnHandle_t, vkdnnExecutionMode);
 vkdnnStatus_t allocateMemory(vkdnnHandle_t, vkdnnMemory_t*, size_t);
 vkdnnStatus_t freeMemory(vkdnnHandle_t, vkdnnMemory_t);
 vkdnnStatus_t copyHtoD(vkdnnHandle_t, vkdnnMemory_t, size_t, const void*, size_t);

@@ -18,6 +18,46 @@
 #define OK(call) REQUIRE((call) == VKBLAS_STATUS_SUCCESS)
 #define RT(call) REQUIRE((call) == vkdnnSuccess)
 
+static void asynchronous(vkblasHandle_t handle)
+{
+    REQUIRE(vkdnnSetExecutionMode(static_cast<vkdnnExecutionMode>(99)) == vkdnnErrorInvalidValue);
+    RT(vkdnnSetExecutionMode(vkdnnExecutionAsynchronous));
+    float identity[] = { 1, 0, 0, 1 };
+    float input[] = { 1, 2, 3, 4 };
+    void *weights = nullptr, *first = nullptr, *second = nullptr;
+    RT(vkdnnMalloc(&weights, sizeof(identity)));
+    RT(vkdnnMalloc(&first, sizeof(input)));
+    RT(vkdnnMalloc(&second, sizeof(input)));
+    RT(vkdnnMemcpy(weights, identity, sizeof(identity), vkdnnMemcpyHostToDevice));
+    RT(vkdnnMemcpy(first, input, sizeof(input), vkdnnMemcpyHostToDevice));
+    float alpha = 0.99f, beta = 0;
+    for (int iteration = 0; iteration < 97; ++iteration)
+    {
+        OK(vkblasSgemm(handle, VKBLAS_OP_N, VKBLAS_OP_N, 2, 2, 2, &alpha,
+            static_cast<float*>(weights), 2, static_cast<float*>(first), 2,
+            &beta, static_cast<float*>(second), 2));
+        std::swap(first, second);
+    }
+    float sum = 0;
+    OK(vkblasSasum(handle, 4, static_cast<float*>(first), 1, &sum));
+    REQUIRE(std::abs(sum - 10 * std::pow(double(alpha), 97)) < 1e-4);
+    RT(vkdnnMemcpy(second, first, sizeof(input), vkdnnMemcpyDeviceToDevice));
+    OK(vkblasSscal(handle, 4, &alpha, static_cast<float*>(second), 1));
+    RT(vkdnnMemcpy(input, second, sizeof(input), vkdnnMemcpyDeviceToHost));
+    for (int index = 0; index < 4; ++index)
+    {
+        REQUIRE(std::abs(input[index] - (index + 1) * std::pow(double(alpha), 98)) < 1e-4);
+    }
+    OK(vkblasSscal(handle, 4, &alpha, static_cast<float*>(first), 1));
+    RT(vkdnnFree(first));
+    OK(vkblasSscal(handle, 4, &alpha, static_cast<float*>(second), 1));
+    RT(vkdnnSetExecutionMode(vkdnnExecutionSynchronous));
+    RT(vkdnnDeviceSynchronize());
+    RT(vkdnnFree(second));
+    RT(vkdnnFree(weights));
+    std::puts("PASS: asynchronous dependent GEMM, slot reuse, reduction, copy, free and mode transition");
+}
+
 static void numerical(vkblasHandle_t handle, vkblasOperation_t ta, vkblasOperation_t tb,
     int m, int n, int k, float alpha, float beta)
 {
@@ -194,6 +234,14 @@ int main()
         }
     }
     numerical(handle, VKBLAS_OP_N, VKBLAS_OP_N, 16, 32, 16, 1, 1);
+    for (auto ta : { VKBLAS_OP_N, VKBLAS_OP_T })
+    {
+        for (auto tb : { VKBLAS_OP_N, VKBLAS_OP_T })
+        {
+            numerical(handle, ta, tb, 10, 100, 784, 0.7f, -0.4f);
+            numerical(handle, ta, tb, 16, 23, 129, 1.f, 0.f);
+        }
+    }
     numerical(handle, VKBLAS_OP_T, VKBLAS_OP_C, 1, 1, 1, -1, 2);
     numerical(handle, VKBLAS_OP_N, VKBLAS_OP_N, 17, 9, 0, std::numeric_limits<float>::quiet_NaN(), 0);
     numerical(handle, VKBLAS_OP_T, VKBLAS_OP_N, 17, 9, 0, 1, -2);
@@ -275,6 +323,7 @@ int main()
     RT(vkdnnFree(b));
     RT(vkdnnFree(c));
     RT(vkdnnDeviceReset());
+    asynchronous(handle);
     scaling(handle);
     numerical(handle, VKBLAS_OP_N, VKBLAS_OP_T, 7, 3, 5, 1, 0);
     OK(vkblasDestroy(handle));

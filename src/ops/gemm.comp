@@ -50,6 +50,40 @@ void main()
         }
         return;
     }
+    if (p.m <= 16 && p.k >= 128)
+    {
+        uint lane = gl_LocalInvocationIndex % 64;
+        uint rowLane = gl_LocalInvocationIndex / 64;
+        uint outputRow = gl_WorkGroupID.x * 4 + rowLane, outputCol = gl_WorkGroupID.y;
+        float value = 0.0;
+        if (outputRow < p.m)
+        {
+            for (uint inner = lane; inner < p.k; inner += 64)
+            {
+                uint firstIndex = outputRow + inner * p.lda;
+                uint secondIndex = inner + outputCol * p.ldb;
+                if (p.transa != 0) { firstIndex = inner + outputRow * p.lda; }
+                if (p.transb != 0) { secondIndex = outputCol + inner * p.ldb; }
+                value += a[p.aOffset + firstIndex] * b[p.bOffset + secondIndex];
+            }
+        }
+        uint slot = rowLane * 64 + lane;
+        reduction[slot] = value;
+        barrier();
+        for (uint step = 32; step > 0; step >>= 1)
+        {
+            if (lane < step) { reduction[slot] += reduction[slot + step]; }
+            barrier();
+        }
+        if (lane == 0 && outputRow < p.m)
+        {
+            uint index = p.cOffset + outputRow + outputCol * p.ldc;
+            float result = p.alpha * reduction[slot];
+            if (p.beta != 0.0) { result += p.beta * c[index]; }
+            c[index] = result;
+        }
+        return;
+    }
     float sum = 0.0;
     for (uint base = 0; base < p.k; base += 16)
     {

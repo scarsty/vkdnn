@@ -165,7 +165,19 @@ vkdnnStatus_t vkdnnExecutePooling(vkdnnHandle_t handle, vkdnnTensorView input, v
     VKDNN_HELPER_CHECK(descriptor.create());
     VKDNN_HELPER_CHECK(vkdnnSetPooling2dDescriptor(descriptor.value, mode, VKDNN_NOT_PROPAGATE_NAN, windowH, windowW, padH, padW, strideH, strideW));
     Output temporary;
-    VKDNN_HELPER_CHECK(temporary.initialize(backward ? input : output, backward != 0, beta));
+    auto target = backward ? input : output;
+    auto destination = backward ? target.gradient : target.data;
+    auto overlaps = [&](const void* source, size_t sourceBytes)
+    {
+        auto destinationAddress = reinterpret_cast<uintptr_t>(destination);
+        auto sourceAddress = reinterpret_cast<uintptr_t>(source);
+        if (!source) { return false; }
+        if (destinationAddress >= sourceAddress) { return destinationAddress - sourceAddress < sourceBytes; }
+        return sourceAddress - destinationAddress < bytes(target);
+    };
+    bool direct = !overlaps(input.data, bytes(input));
+    if (backward) { direct = direct && !overlaps(output.data, bytes(output)) && !overlaps(output.gradient, bytes(output)); }
+    VKDNN_HELPER_CHECK(temporary.initialize(target, backward != 0, beta, direct));
     if (backward) { VKDNN_HELPER_CHECK(vkdnnPoolingBackward(handle, descriptor.value, &alpha, outputDesc.value, output.data, outputDesc.value, output.gradient, inputDesc.value, input.data, &beta, inputDesc.value, temporary.data)); }
     else
     {
@@ -192,7 +204,23 @@ vkdnnStatus_t vkdnnExecuteConvolution(vkdnnHandle_t handle, vkdnnTensorView inpu
     if (direction == VKDNN_HELPER_BACKWARD_DATA) { target = input; }
     else if (direction == VKDNN_HELPER_BACKWARD_FILTER) { target = weights; }
     Output temporary;
-    VKDNN_HELPER_CHECK(temporary.initialize(target, direction != VKDNN_HELPER_FORWARD, beta));
+    auto destination = direction == VKDNN_HELPER_FORWARD ? target.data : target.gradient;
+    auto overlaps = [&](const void* source, size_t sourceBytes)
+    {
+        auto destinationAddress = reinterpret_cast<uintptr_t>(destination);
+        auto sourceAddress = reinterpret_cast<uintptr_t>(source);
+        if (!source) { return false; }
+        if (destinationAddress >= sourceAddress) { return destinationAddress - sourceAddress < sourceBytes; }
+        return sourceAddress - destinationAddress < bytes(target);
+    };
+    bool direct = false;
+    if (direction == VKDNN_HELPER_FORWARD) { direct = !overlaps(input.data, bytes(input)) && !overlaps(weights.data, bytes(weights)); }
+    else if (direction == VKDNN_HELPER_BACKWARD_DATA) { direct = !overlaps(weights.data, bytes(weights)) && !overlaps(output.gradient, bytes(output)); }
+    else
+    {
+        direct = !overlaps(input.data, bytes(input)) && !overlaps(output.gradient, bytes(output));
+    }
+    VKDNN_HELPER_CHECK(temporary.initialize(target, direction != VKDNN_HELPER_FORWARD, beta, direct));
     if (direction == VKDNN_HELPER_BACKWARD_DATA) { VKDNN_HELPER_CHECK(vkdnnConvolutionBackwardData(handle, &alpha, filter.value, weights.data, outputDesc.value, output.gradient, convolution.value, VKDNN_CONVOLUTION_BWD_DATA_ALGO_0, nullptr, 0, &beta, inputDesc.value, temporary.data)); }
     else if (direction == VKDNN_HELPER_BACKWARD_FILTER) { VKDNN_HELPER_CHECK(vkdnnConvolutionBackwardFilter(handle, &alpha, inputDesc.value, input.data, outputDesc.value, output.gradient, convolution.value, VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0, nullptr, 0, &beta, filter.value, temporary.data)); }
     else

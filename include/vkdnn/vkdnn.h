@@ -79,6 +79,16 @@ VKDNN_API vkdnnError_t vkdnnGetDeviceProperties(struct vkdnnDeviceProp* prop, in
 VKDNN_API vkdnnError_t vkdnnSetDevice(int device);
 VKDNN_API vkdnnError_t vkdnnGetDevice(int* device);
 VKDNN_API vkdnnError_t vkdnnDeviceSynchronize(void);
+/* Vulkan extension, not a CUDA API. Per-device and shared across threads.
+ * Default is synchronous. Mode changes wait for outstanding work. Asynchronous
+ * compute uses a bounded queue and may wait for resource reuse. Copies, free,
+ * reset and host scalar reductions remain completion boundaries. */
+typedef enum vkdnnExecutionMode
+{
+    vkdnnExecutionSynchronous = 0,
+    vkdnnExecutionAsynchronous = 1
+} vkdnnExecutionMode;
+VKDNN_API vkdnnError_t vkdnnSetExecutionMode(enum vkdnnExecutionMode mode);
 /* Frees all allocations on the current device. Caller must coordinate other
  * threads; all old pointers become invalid. Reset before unloading the library. */
 VKDNN_API vkdnnError_t vkdnnDeviceReset(void);

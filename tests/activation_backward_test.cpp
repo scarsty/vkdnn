@@ -78,6 +78,79 @@ int main()
         RT(vkdnnFree(data));
         std::puts("Execution helpers aliasing, accumulation and invalid parameters passed");
     }
+    {
+        void* allocation[4]{};
+        for (auto& pointer : allocation) { RT(vkdnnMalloc(&pointer, 2 * sizeof(float))); }
+        for (int direction = 0; direction < 3; ++direction)
+        {
+            for (bool alias : { false, true })
+            {
+                float inputValues[2] = { 2, 3 }, weightValues[2] = { 4, 0 }, gradientValues[2] = { 5, 7 }, initial[2] = { 11, 13 };
+                RT(vkdnnMemcpy(allocation[0], inputValues, sizeof(inputValues), vkdnnMemcpyHostToDevice));
+                RT(vkdnnMemcpy(allocation[1], weightValues, sizeof(weightValues), vkdnnMemcpyHostToDevice));
+                RT(vkdnnMemcpy(allocation[2], gradientValues, sizeof(gradientValues), vkdnnMemcpyHostToDevice));
+                RT(vkdnnMemcpy(allocation[3], initial, sizeof(initial), vkdnnMemcpyHostToDevice));
+                void* destination = alias ? allocation[0] : allocation[3];
+                vkdnnTensorView input{ 1, 1, 1, 2, allocation[0], destination };
+                vkdnnTensorView weights{ 1, 1, 1, 1, allocation[1], destination };
+                vkdnnTensorView output{ 1, 1, 1, 2, destination, allocation[2] };
+                OK(vkdnnExecuteConvolution(handle, input, weights, output, 1, 1, 0, 0, 2, 0.5f,
+                    static_cast<vkdnnConvolutionDirection>(direction)));
+                float actual[2]{};
+                RT(vkdnnMemcpy(actual, destination, sizeof(actual), vkdnnMemcpyDeviceToHost));
+                double priorFirst = alias ? 2 : 11;
+                double priorSecond = alias ? 3 : 13;
+                if (direction == 0)
+                {
+                    compare(actual[0], 16 + 0.5 * priorFirst);
+                    compare(actual[1], 24 + 0.5 * priorSecond);
+                }
+                else if (direction == 1)
+                {
+                    compare(actual[0], 40 + 0.5 * priorFirst);
+                    compare(actual[1], 56 + 0.5 * priorSecond);
+                }
+                else
+                {
+                    compare(actual[0], 62 + 0.5 * priorFirst);
+                }
+            }
+        }
+        for (auto pointer : allocation) { RT(vkdnnFree(pointer)); }
+        std::puts("Convolution helpers direct/alias outputs and beta accumulation passed");
+    }
+    {
+        void* buffers[4]{};
+        for (auto& pointer : buffers) { RT(vkdnnMalloc(&pointer, 4 * sizeof(float))); }
+        for (bool alias : { false, true })
+        {
+            float values[4] = { 1, 3, 2, 4 }, gradients[4] = { 5, 0, 0, 0 }, prior[4] = { 2, 2, 2, 2 };
+            RT(vkdnnMemcpy(buffers[0], values, sizeof(values), vkdnnMemcpyHostToDevice));
+            RT(vkdnnMemcpy(buffers[1], prior, sizeof(prior), vkdnnMemcpyHostToDevice));
+            RT(vkdnnMemcpy(buffers[2], gradients, sizeof(gradients), vkdnnMemcpyHostToDevice));
+            RT(vkdnnMemcpy(buffers[3], prior, sizeof(prior), vkdnnMemcpyHostToDevice));
+            void* destination = alias ? buffers[0] : buffers[1];
+            vkdnnTensorView input{ 1, 1, 2, 2, buffers[0], buffers[3] };
+            vkdnnTensorView output{ 1, 1, 1, 1, destination, buffers[2] };
+            OK(vkdnnExecutePooling(handle, input, output, VKDNN_POOLING_MAX, 2, 2, 2, 2, 0, 0, 2, 0.5f, 0));
+            float actual[4]{};
+            RT(vkdnnMemcpy(actual, destination, sizeof(float), vkdnnMemcpyDeviceToHost));
+            compare(actual[0], alias ? 8.5 : 9.0);
+            RT(vkdnnMemcpy(buffers[0], values, sizeof(values), vkdnnMemcpyHostToDevice));
+            input.gradient = alias ? buffers[0] : buffers[3];
+            output.data = buffers[1];
+            OK(vkdnnExecutePooling(handle, input, output, VKDNN_POOLING_MAX, 2, 2, 2, 2, 0, 0, 2, 0.5f, 1));
+            RT(vkdnnMemcpy(actual, input.gradient, sizeof(actual), vkdnnMemcpyDeviceToHost));
+            for (int index = 0; index < 4; ++index)
+            {
+                double expected = alias ? values[index] * 0.5 : 1;
+                if (index == 3) { expected += 10; }
+                compare(actual[index], expected);
+            }
+        }
+        for (auto pointer : buffers) { RT(vkdnnFree(pointer)); }
+        std::puts("Pooling helpers direct/alias outputs and beta accumulation passed");
+    }
     OK(vkdnnCreateActivationDescriptor(&activation));
     OK(vkdnnCreateActivationDescriptor(&unsetActivation));
     OK(vkdnnCreateTensorDescriptor(&tensor));

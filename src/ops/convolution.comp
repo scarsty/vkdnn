@@ -113,6 +113,26 @@ float gradient(uint i)
         }
         return sum;
     }
+    if (p.op == 10)
+    {
+        uint ix = i % p.w, iy = (i / p.w) % p.h;
+        uint ic = (i / (p.h * p.w)) % p.c, batch = i / (p.h * p.w * p.c);
+        for (uint channel = 0; channel < p.k; ++channel)
+        {
+            uint weightBase = p.aOffset + (channel * p.c + ic) * 9;
+            uint gradientBase = p.bOffset + (batch * p.k + channel) * p.oh * p.ow;
+            for (uint tap = 0; tap < 9; ++tap)
+            {
+                int row = int(iy) - int(tap / 3);
+                int column = int(ix) - int(tap % 3);
+                if (row >= 0 && column >= 0 && row < int(p.oh) && column < int(p.ow))
+                {
+                    sum += product(x[weightBase + tap], w[gradientBase + uint(row) * p.ow + uint(column)]);
+                }
+            }
+        }
+        return sum;
+    }
     if (p.op == 1)
     {
         uint ix = i % p.w, iy = (i / p.w) % p.h;
@@ -167,6 +187,119 @@ float gradient(uint i)
 }
 void main()
 {
+    if (p.op == 8)
+    {
+        uint index = gl_GlobalInvocationID.x;
+        if (index >= p.count) { return; }
+        float sum = 0.0;
+        for (uint split = 0; split < p.nan; ++split) { sum += x[p.aOffset + index * p.nan + split]; }
+        float result = product(p.alpha, sum);
+        if (p.beta != 0.0) { result += product(p.beta, y[p.cOffset + index]); }
+        if (nanBits(p.alpha) || nanBits(p.beta) || nanBits(result)) { result = uintBitsToFloat(0x7fc00000u); }
+        y[p.cOffset + index] = result;
+        return;
+    }
+    if ((p.op == 3 && p.count <= 65535) || p.op == 9)
+    {
+        uint channel = gl_WorkGroupID.x;
+        uint split = 0, splits = 1;
+        if (p.op == 9)
+        {
+            split = channel % p.nan;
+            channel /= p.nan;
+            splits = p.nan;
+        }
+        uint lane = gl_LocalInvocationID.x;
+        float sum = 0.0;
+        if (p.alpha != 0.0)
+        {
+            for (uint position = split * 64 + lane; position < p.n * p.oh * p.ow; position += 64 * splits)
+            {
+                uint batch = position / (p.oh * p.ow);
+                uint spatial = position % (p.oh * p.ow);
+                sum += x[p.aOffset + (batch * p.k + channel) * p.oh * p.ow + spatial];
+            }
+        }
+        partial[lane] = sum;
+        barrier();
+        for (uint step = 32; step > 0; step >>= 1)
+        {
+            if (lane < step) { partial[lane] += partial[lane + step]; }
+            barrier();
+        }
+        if (lane == 0)
+        {
+            if (p.op == 9)
+            {
+                y[channel * splits + split] = partial[0];
+                return;
+            }
+            float result = 0.0;
+            if (p.alpha != 0.0) { result = product(p.alpha, partial[0]); }
+            if (p.beta != 0.0) { result += product(p.beta, y[p.cOffset + channel]); }
+            if (nanBits(p.alpha) || nanBits(p.beta) || nanBits(result)) { result = uintBitsToFloat(0x7fc00000u); }
+            y[p.cOffset + channel] = result;
+        }
+        return;
+    }
+    if ((p.op == 2 && p.count <= 65535) || p.op == 7)
+    {
+        uint weightIndex = gl_WorkGroupID.x;
+        uint split = 0, splits = 1;
+        if (p.op == 7)
+        {
+            split = weightIndex % p.nan;
+            weightIndex /= p.nan;
+            splits = p.nan;
+        }
+        if (weightIndex >= p.count) { return; }
+        uint lane = gl_LocalInvocationID.x;
+        uint fx = weightIndex % p.kw, fy = (weightIndex / p.kw) % p.kh;
+        uint ic = (weightIndex / (p.kh * p.kw)) % p.fc;
+        uint oc = weightIndex / (p.kh * p.kw * p.fc);
+        uint ky = fy, kx = fx;
+        if (p.mode == 0)
+        {
+            ky = p.kh - 1 - fy;
+            kx = p.kw - 1 - fx;
+        }
+        uint channel = oc / (p.k / p.groups) * p.fc + ic;
+        float sum = 0.0;
+        if (p.alpha != 0.0)
+        {
+            for (uint position = split * 64 + lane; position < p.n * p.oh * p.ow; position += 64 * splits)
+            {
+                uint ox = position % p.ow, oy = (position / p.ow) % p.oh;
+                uint batch = position / (p.oh * p.ow);
+                int iy = int(oy * p.sh + ky * p.dh) - int(p.ph);
+                int ix = int(ox * p.sw + kx * p.dw) - int(p.pw);
+                if (iy < 0 || ix < 0 || iy >= int(p.h) || ix >= int(p.w)) { continue; }
+                sum += product(x[p.aOffset + ((batch * p.c + channel) * p.h + uint(iy)) * p.w + uint(ix)],
+                               w[p.bOffset + (batch * p.k + oc) * p.oh * p.ow + oy * p.ow + ox]);
+            }
+        }
+        partial[lane] = sum;
+        barrier();
+        for (uint step = 32; step > 0; step >>= 1)
+        {
+            if (lane < step) { partial[lane] += partial[lane + step]; }
+            barrier();
+        }
+        if (lane == 0)
+        {
+            if (p.op == 7)
+            {
+                y[weightIndex * splits + split] = partial[0];
+                return;
+            }
+            float result = 0.0;
+            if (p.alpha != 0.0) { result = product(p.alpha, partial[0]); }
+            if (p.beta != 0.0) { result += product(p.beta, y[p.cOffset + weightIndex]); }
+            if (nanBits(p.alpha) || nanBits(p.beta) || nanBits(result)) { result = uintBitsToFloat(0x7fc00000u); }
+            y[p.cOffset + weightIndex] = result;
+        }
+        return;
+    }
     if (p.op == 6)
     {
         uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
@@ -238,28 +371,51 @@ void main()
             uint batch = i / (p.ow * p.oh * p.k);
             uint first = (oc / (p.k / p.groups)) * p.fc;
             bool bad = false;
-            for (uint ic = 0; ic < p.fc; ++ic)
+            bool direct3x3 = p.kh == 3 && p.kw == 3 && p.sh == 1 && p.sw == 1
+                && p.dh == 1 && p.dw == 1 && p.ph == 0 && p.pw == 0
+                && p.mode == 1 && p.h >= 3 && p.w >= 3 && p.oh == p.h - 2 && p.ow == p.w - 2;
+            if (direct3x3)
             {
-                for (uint ky = 0; ky < p.kh; ++ky)
+                for (uint channel = 0; channel < p.fc; ++channel)
                 {
-                    int iy = int(oy * p.sh + ky * p.dh) - int(p.ph);
-                    if (iy < 0 || iy >= int(p.h)) { continue; }
-                    for (uint kx = 0; kx < p.kw; ++kx)
+                    uint inputBase = p.aOffset + ((batch * p.c + first + channel) * p.h + oy) * p.w + ox;
+                    uint weightBase = p.bOffset + (oc * p.fc + channel) * 9;
+                    for (uint tap = 0; tap < 9; ++tap)
                     {
-                        int ix = int(ox * p.sw + kx * p.dw) - int(p.pw);
-                        if (ix < 0 || ix >= int(p.w)) { continue; }
-                        uint wy = ky, wx = kx;
-                        if (p.mode == 0)
-                        {
-                            wy = p.kh - 1 - ky;
-                            wx = p.kw - 1 - kx;
-                        }
-                        float a = x[p.aOffset + ((batch * p.c + first + ic) * p.h + uint(iy)) * p.w + uint(ix)];
-                        float b = w[p.bOffset + ((oc * p.fc + ic) * p.kh + wy) * p.kw + wx];
-                        float product = a * b;
-                        bad = bad || nanBits(a) || nanBits(b) || nanBits(product);
-                        result += product;
+                        float inputValue = x[inputBase + (tap / 3) * p.w + tap % 3];
+                        float weightValue = w[weightBase + tap];
+                        float value = inputValue * weightValue;
+                        bad = bad || nanBits(inputValue) || nanBits(weightValue) || nanBits(value);
+                        result += value;
                         bad = bad || nanBits(result);
+                    }
+                }
+            }
+            else
+            {
+                for (uint ic = 0; ic < p.fc; ++ic)
+                {
+                    for (uint ky = 0; ky < p.kh; ++ky)
+                    {
+                        int iy = int(oy * p.sh + ky * p.dh) - int(p.ph);
+                        if (iy < 0 || iy >= int(p.h)) { continue; }
+                        for (uint kx = 0; kx < p.kw; ++kx)
+                        {
+                            int ix = int(ox * p.sw + kx * p.dw) - int(p.pw);
+                            if (ix < 0 || ix >= int(p.w)) { continue; }
+                            uint wy = ky, wx = kx;
+                            if (p.mode == 0)
+                            {
+                                wy = p.kh - 1 - ky;
+                                wx = p.kw - 1 - kx;
+                            }
+                            float a = x[p.aOffset + ((batch * p.c + first + ic) * p.h + uint(iy)) * p.w + uint(ix)];
+                            float b = w[p.bOffset + ((oc * p.fc + ic) * p.kh + wy) * p.kw + wx];
+                            float product = a * b;
+                            bad = bad || nanBits(a) || nanBits(b) || nanBits(product);
+                            result += product;
+                            bad = bad || nanBits(result);
+                        }
                     }
                 }
             }

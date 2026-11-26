@@ -396,6 +396,47 @@ int main()
         REQUIRE(bytes == 123);
         REQUIRE(vkdnnSetTensor4dDescriptor(wrong, VKDNN_TENSOR_NCHW, VKDNN_DATA_FLOAT, INT_MAX, INT_MAX, INT_MAX, INT_MAX) == VKDNN_STATUS_NOT_SUPPORTED);
     }
+    {
+        set(xd, 100, 1, 20, 20);
+        set(yd, 100, 1, 20, 20);
+        set(bd, 1, 1, 1, 1);
+        OK(vkdnnSetFilter4dDescriptor(fd, VKDNN_DATA_FLOAT, VKDNN_TENSOR_NCHW, 1, 1, 1, 1));
+        OK(vkdnnSetConvolution2dDescriptor(cd, 0, 0, 1, 1, 1, 1, VKDNN_CROSS_CORRELATION, VKDNN_DATA_FLOAT));
+        Buffer input(40000), gradient(40000), result(1), biasResult(1);
+        std::vector<float> source(40000), dy(40000);
+        double reference = 0, biasReference = 0;
+        for (size_t index = 0; index < source.size(); ++index)
+        {
+            source[index] = float(int(index % 17) - 8) * 0.11f;
+            dy[index] = float(int(index % 13) - 6) * 0.07f;
+            reference += double(source[index]) * dy[index];
+            biasReference += dy[index];
+        }
+        input.put(source);
+        gradient.put(dy);
+        float alpha = 1.25f, beta = 0.5f;
+        for (int iteration = 0; iteration < 3; ++iteration)
+        {
+            result.put({ 2 });
+            OK(vkdnnConvolutionBackwardFilter(handle, &alpha, xd, input.p, yd, gradient.p, cd,
+                VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0, nullptr, 0, &beta, fd, result.p));
+            check(result.get(), { reference }, alpha, beta);
+            biasResult.put({ 2 });
+            OK(vkdnnConvolutionBackwardBias(handle, &alpha, yd, gradient.p, &beta, bd, biasResult.p));
+            check(biasResult.get(), { biasReference }, alpha, beta);
+        }
+        source[8193] = NAN;
+        input.put(source);
+        OK(vkdnnConvolutionBackwardFilter(handle, &alpha, xd, input.p, yd, gradient.p, cd,
+            VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0, nullptr, 0, &beta, fd, result.p));
+        REQUIRE(std::isnan(result.get()[0]));
+        alpha = 0;
+        result.put({ 2 });
+        OK(vkdnnConvolutionBackwardFilter(handle, &alpha, xd, nullptr, yd, nullptr, cd,
+            VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0, nullptr, 0, &beta, fd, result.p));
+        check(result.get(), { 0 }, alpha, beta);
+        std::puts("PASS: split dW CPU reference, offsets, repeated calls, alpha/beta and NaN");
+    }
     std::puts("PASS: convolution dx/dw/db CPU reference, CPU/GPU finite differences, groups/depthwise/flip/stride/dilation/padding, scalars, overflow and ranges");
     for (int mode = 0; mode < 3; ++mode)
     {
