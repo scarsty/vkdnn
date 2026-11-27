@@ -79,8 +79,14 @@ int main(void)
         CHECK(vkdnnMemset(yp, 0xff, sizeof(output)) == vkdnnSuccess);
         OK(vkdnnFindConvolutionForwardAlgorithmEx(handle, x, xp, w, wp, conv, y, yp, 2, &count, f, NULL, 0));
         CHECK(count == 1 && f[0].algo == VKDNN_CONVOLUTION_FWD_ALGO_DIRECT && f[0].status == VKDNN_STATUS_SUCCESS);
-        CHECK(isfinite(f[0].time) && f[0].time >= 0.0f && f[0].memory == 0);
+        CHECK(isnan(f[0].time) && f[0].memory == 0);
         CHECK(memcmp(&f[1], &saved[1], sizeof(f[1])) == 0);
+        CHECK(vkdnnMemcpy(output, yp, sizeof(output), vkdnnMemcpyDeviceToHost) == vkdnnSuccess);
+        for (i = 0; i < 18; ++i) { CHECK(isnan(output[i])); }
+        {
+            const float alpha = 1, beta = 0;
+            OK(vkdnnConvolutionForward(handle, &alpha, x, xp, w, wp, conv, f[0].algo, NULL, 0, &beta, y, yp));
+        }
         CHECK(vkdnnMemcpy(output, yp, sizeof(output), vkdnnMemcpyDeviceToHost) == vkdnnSuccess);
         for (i = 0; i < 18; ++i) { CHECK(output[i] == 6.0f); }
         memcpy(ds, d, sizeof(d));
@@ -89,19 +95,31 @@ int main(void)
         CHECK(isfinite(d[0].time) && d[0].time >= 0.0f && d[0].memory == 0);
         CHECK(memcmp(&d[1], &ds[1], sizeof(d[1])) == 0);
         CHECK(vkdnnMemcpy(output, xp, sizeof(output), vkdnnMemcpyDeviceToHost) == vkdnnSuccess);
+        for (i = 0; i < 18; ++i) { CHECK(output[i] == 2.0f); }
+        {
+            const float alpha = 1, beta = 0;
+            OK(vkdnnConvolutionBackwardData(handle, &alpha, w, wp, y, yp, conv, d[0].algo, NULL, 0, &beta, x, xp));
+        }
+        CHECK(vkdnnMemcpy(output, xp, sizeof(output), vkdnnMemcpyDeviceToHost) == vkdnnSuccess);
         for (i = 0; i < 18; ++i) { CHECK(output[i] == 18.0f); }
         memcpy(bs, b, sizeof(b));
         OK(vkdnnFindConvolutionBackwardFilterAlgorithmEx(handle, x, xp, y, yp, conv, w, wp, 2, &count, b, NULL, 0));
-        CHECK(count == 1 && b[0].algo == VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0 && b[0].status == VKDNN_STATUS_SUCCESS);
+        CHECK(count == 2 && b[0].status == VKDNN_STATUS_SUCCESS && b[1].status == VKDNN_STATUS_SUCCESS);
+        CHECK(b[0].time <= b[1].time);
         CHECK(isfinite(b[0].time) && b[0].time >= 0.0f && b[0].memory == 0);
-        CHECK(memcmp(&b[1], &bs[1], sizeof(b[1])) == 0);
+        CHECK(vkdnnMemcpy(weights, wp, sizeof(weights), vkdnnMemcpyDeviceToHost) == vkdnnSuccess);
+        CHECK(weights[0] == 3.0f && weights[1] == 3.0f);
+        {
+            const float alpha = 1, beta = 0;
+            OK(vkdnnConvolutionBackwardFilter(handle, &alpha, x, xp, y, yp, conv, b[0].algo, NULL, 0, &beta, w, wp));
+        }
         CHECK(vkdnnMemcpy(weights, wp, sizeof(weights), vkdnnMemcpyDeviceToHost) == vkdnnSuccess);
         CHECK(weights[0] == 972.0f && weights[1] == 972.0f);
-        printf("FindEx synchronous host ms: forward=%g dx=%g dw=%g\n", f[0].time, d[0].time, b[0].time);
+        printf("FindEx ms (forward unmeasured, backward GPU when supported): forward=%g dx=%g dw=%g\n", f[0].time, d[0].time, b[0].time);
         memcpy(saved, f, sizeof(f));
         count = -1;
-        CHECK(vkdnnFindConvolutionForwardAlgorithmEx(handle, x, xp, w, wp, conv, y, xp, 2, &count, f, NULL, 0) == VKDNN_STATUS_NOT_SUPPORTED);
-        CHECK(count == -1 && memcmp(saved, f, sizeof(f)) == 0);
+        OK(vkdnnFindConvolutionForwardAlgorithmEx(handle, x, xp, w, wp, conv, y, xp, 2, &count, f, NULL, 0));
+        CHECK(count == 1 && isnan(f[0].time));
         CHECK(vkdnnMemcpy(output, yp, sizeof(output), vkdnnMemcpyDeviceToHost) == vkdnnSuccess);
         for (i = 0; i < 18; ++i) { CHECK(output[i] == 6.0f); }
         CHECK(vkdnnFree(wp) == vkdnnSuccess);

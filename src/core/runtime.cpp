@@ -288,12 +288,17 @@ vkdnnError_t runtimeReduce(int device, const void* x, size_t xBytes, const void*
 }
 
 vkdnnError_t runtimeConvolution(int device, const void* x, size_t xBytes, const void* w, size_t wBytes,
-    void* y, size_t yBytes, ConvolutionParams params, const void* extra, size_t extraBytes)
+    void* y, size_t yBytes, ConvolutionParams params, const void* extra, size_t extraBytes,
+    std::vector<std::pair<uint32_t, double>>* timings)
 {
     VKDNN_PROFILE_SCOPE("api.convolution." + std::to_string(params.op));
     bool exactAlias = params.op == 5 && params.w == params.ow && params.h == params.oh
         && params.c == params.k;
-    return runtimeProduct(device, x, xBytes, w, wBytes, y, yBytes, params, convolutionBuffers, extra, extraBytes, exactAlias);
+    auto execute = [&](auto context, auto input, auto weights, auto output, const ConvolutionParams& parameters)
+    {
+        return convolutionBuffers(context, input, weights, output, parameters, timings);
+    };
+    return runtimeProduct(device, x, xBytes, w, wBytes, y, yBytes, params, execute, extra, extraBytes, exactAlias);
 }
 
 vkdnnError_t vkdnnGetDevice(int* device)
@@ -463,6 +468,28 @@ vkdnnError_t vkdnnMemcpy(void* dst, const void* src, size_t count, enum vkdnnMem
             if (destination.allocation->device != source.allocation->device) { return vkdnnErrorNotSupported; }
             return copyDtoD(destination.allocation->context, destination.allocation->memory, destination.offset,
                 source.allocation->memory, source.offset, count);
+        });
+}
+
+vkdnnError_t vkdnnMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, enum vkdnnMemcpyKind kind)
+{
+    if (kind != vkdnnMemcpyDeviceToDevice && kind != vkdnnMemcpyDefault) { return vkdnnErrorInvalidMemcpyDirection; }
+    if (!width || !height) { return vkdnnSuccess; }
+    if (!dst || !src || width > dpitch || width > spitch || height > UINT32_MAX) { return vkdnnErrorInvalidValue; }
+    size_t limit = std::numeric_limits<size_t>::max();
+    if (height - 1 > (limit - width) / dpitch || height - 1 > (limit - width) / spitch) { return vkdnnErrorInvalidValue; }
+    size_t dstBytes = (height - 1) * dpitch + width;
+    size_t srcBytes = (height - 1) * spitch + width;
+    return guarded([&](Runtime& state)
+        {
+            auto destination = locate(state, dst);
+            auto source = locate(state, src);
+            if (!fits(destination, dstBytes) || !fits(source, srcBytes)) { return vkdnnErrorInvalidValue; }
+            if (destination.allocation->device != source.allocation->device) { return vkdnnErrorNotSupported; }
+            if (destination.allocation == source.allocation && destination.offset < source.offset + srcBytes && source.offset < destination.offset + dstBytes) { return vkdnnErrorInvalidValue; }
+            if ((destination.offset | source.offset | dpitch | spitch | width) % 4) { return vkdnnErrorNotSupported; }
+            return copyDtoD2D(destination.allocation->context, destination.allocation->memory, destination.offset, dpitch,
+                source.allocation->memory, source.offset, spitch, width, height);
         });
 }
 

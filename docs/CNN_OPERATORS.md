@@ -10,6 +10,29 @@
 - 不支持的算法、精度及布局返回对应层错误，不伪装成功。
 - 初步面向 FP32、二维张量/卷积。枚举只是参考接口子集，声明 DOUBLE/HALF、算法或布局并不代表支持。
 
+### TensorView 扩展命名（2026-11-26）
+
+标准描述符接口继续使用 `vkdnnActivationForward/Backward`、`vkdnnPoolingForward/Backward`
+及 `vkdnnConvolutionForward/BackwardData/BackwardFilter`，名称和参数组织参考 cuDNN。
+TensorView 便捷层新增 `vkdnnActivationForwardEx/BackwardEx` 和
+`vkdnnPoolingForwardEx/BackwardEx`，以方向明确的入口替代末尾的 backward 标志。
+这些 Ex 是本库扩展，不代表 cuDNN 存在同签名接口，也不承诺 ABI 兼容。
+卷积 TensorView 使用 `vkdnnConvolutionForwardEx/BackwardDataEx/BackwardFilterEx`。
+旧 Execute C 导出及公开方向枚举已删除，不保留兼容包装；旧调用方需迁移并重新链接。
+cccc 使用激活、池化和卷积 Ex，不再自行设置卷积描述符或按方向统一分发。
+卷积三个方向共享库内的 ConvolutionDescriptors，统一校验和准备张量、滤波器及卷积描述符；
+各方向独立处理别名输出并调用对应标准算子，不使用带方向标志的 Impl。
+卷积 Ex 末尾新增对应方向的 algorithm 参数，属于 ABI 变更，调用方必须同步更新并重新链接。
+TensorView 显式选优使用 vkdnnFindConvolutionForwardAlgorithmViewEx、
+vkdnnFindConvolutionBackwardDataAlgorithmViewEx 和 vkdnnFindConvolutionBackwardFilterAlgorithmViewEx；
+这三个入口共享同一描述符准备对象，返回标准算法性能结果，不保存 cccc 类型或算法缓存。
+cccc 仅负责 Matrix 适配、首次或 batch 数变化时显式 Find，以及在各方向 method 中缓存结果。
+
+卷积选优只由显式 `FindConvolution*AlgorithmEx` 请求触发，普通执行直接使用调用方传入算法。
+前向目前只有 DIRECT 候选，Find 直接返回，time 为 NaN，且不执行或修改输出；
+反向 Find 校验候选并测速，结果由 cccc 的 method 保存，后续调用不重新选优。
+当前 split scratch 仍由内部运行时管理，不能把这一实现描述为完全外部 workspace 管理。
+
 ## 最小前向算子集
 
 ### 已实现的精确范围

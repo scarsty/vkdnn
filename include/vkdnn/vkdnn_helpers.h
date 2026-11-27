@@ -24,21 +24,28 @@ typedef enum vkdnnActivationKind
     VKDNN_HELPER_SOFTMAX_CHANNEL
 } vkdnnActivationKind;
 
-typedef enum vkdnnConvolutionDirection
-{
-    VKDNN_HELPER_FORWARD,
-    VKDNN_HELPER_BACKWARD_DATA,
-    VKDNN_HELPER_BACKWARD_FILTER
-} vkdnnConvolutionDirection;
+VKDNN_API vkdnnStatus_t vkdnnActivationForwardEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView output,
+    vkdnnActivationKind activation, float alpha, float beta);
+VKDNN_API vkdnnStatus_t vkdnnActivationBackwardEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView output,
+    vkdnnActivationKind activation, float alpha, float beta);
+VKDNN_API vkdnnStatus_t vkdnnPoolingForwardEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView output,
+    vkdnnPoolingMode_t mode, int windowH, int windowW, int strideH, int strideW, int padH, int padW, float alpha, float beta);
+VKDNN_API vkdnnStatus_t vkdnnPoolingBackwardEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView output,
+    vkdnnPoolingMode_t mode, int windowH, int windowW, int strideH, int strideW, int padH, int padW, float alpha, float beta);
 
-VKDNN_API vkdnnStatus_t vkdnnExecuteActivation(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView output,
-    vkdnnActivationKind activation, float alpha, float beta, int backward);
-VKDNN_API vkdnnStatus_t vkdnnExecutePooling(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView output,
-    vkdnnPoolingMode_t mode, int windowH, int windowW, int strideH, int strideW, int padH, int padW,
-    float alpha, float beta, int backward);
-VKDNN_API vkdnnStatus_t vkdnnExecuteConvolution(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView weights,
-    vkdnnTensorView output, int strideH, int strideW, int padH, int padW, float alpha, float beta,
-    vkdnnConvolutionDirection direction);
+VKDNN_API vkdnnStatus_t vkdnnConvolutionForwardEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView weights,
+    vkdnnTensorView output, int strideH, int strideW, int padH, int padW, float alpha, float beta, vkdnnConvolutionFwdAlgo_t algorithm);
+VKDNN_API vkdnnStatus_t vkdnnConvolutionBackwardDataEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView weights,
+    vkdnnTensorView output, int strideH, int strideW, int padH, int padW, float alpha, float beta, vkdnnConvolutionBwdDataAlgo_t algorithm);
+VKDNN_API vkdnnStatus_t vkdnnConvolutionBackwardFilterEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView weights,
+    vkdnnTensorView output, int strideH, int strideW, int padH, int padW, float alpha, float beta, vkdnnConvolutionBwdFilterAlgo_t algorithm);
+
+VKDNN_API vkdnnStatus_t vkdnnFindConvolutionForwardAlgorithmViewEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView weights,
+    vkdnnTensorView output, int strideH, int strideW, int padH, int padW, int requested, int* returned, vkdnnConvolutionFwdAlgoPerf_t* results);
+VKDNN_API vkdnnStatus_t vkdnnFindConvolutionBackwardDataAlgorithmViewEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView weights,
+    vkdnnTensorView output, int strideH, int strideW, int padH, int padW, int requested, int* returned, vkdnnConvolutionBwdDataAlgoPerf_t* results);
+VKDNN_API vkdnnStatus_t vkdnnFindConvolutionBackwardFilterAlgorithmViewEx(vkdnnHandle_t handle, vkdnnTensorView input, vkdnnTensorView weights,
+    vkdnnTensorView output, int strideH, int strideW, int padH, int padW, int requested, int* returned, vkdnnConvolutionBwdFilterAlgoPerf_t* results);
 
 #ifdef __cplusplus
 }

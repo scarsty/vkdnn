@@ -85,12 +85,20 @@ typedef enum vkdnnConvolutionFwdAlgo_t
 typedef enum vkdnnConvolutionBwdDataAlgo_t
 {
     /* Local zero-workspace gather baseline, NOT cuDNN's atomic/non-deterministic implementation. */
-    VKDNN_CONVOLUTION_BWD_DATA_ALGO_0 = 0
+    VKDNN_CONVOLUTION_BWD_DATA_ALGO_0 = 0,
+    VKDNN_CONVOLUTION_BWD_DATA_ALGO_DIRECT_3X3 = 2
 } vkdnnConvolutionBwdDataAlgo_t;
 typedef enum vkdnnConvolutionBwdFilterAlgo_t
 {
     /* Same local implementation deviation as BWD_DATA_ALGO_0; see CNN_OPERATORS.md. */
-    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0 = 0
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0 = 0,
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_SPLIT_8 = 8,
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_SPLIT_32 = 32,
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_SPLIT_64 = 64,
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_TAPS_3X3 = 128,
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_TILE_3X3_32 = 256,
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_TILE_3X3_8 = 257,
+    VKDNN_CONVOLUTION_BWD_FILTER_ALGO_TILE_3X3_64 = 258
 } vkdnnConvolutionBwdFilterAlgo_t;
 
 /* Implemented: handle/tensor/filter/convolution/ReLU/sigmoid/tanh/pooling descriptors and their forward calls,

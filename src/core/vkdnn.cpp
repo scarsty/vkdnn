@@ -24,6 +24,7 @@ static VkResult profileQueueSubmit(VkQueue queue, uint32_t count, const VkSubmit
 #define vkQueueSubmit profileQueueSubmit
 #endif
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -94,6 +95,7 @@ struct vkdnnContext
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer command = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        VkFence completionFence = VK_NULL_HANDLE;
         VkDescriptorPool descriptors = VK_NULL_HANDLE;
         bool pending = false;
 #ifdef VKDNN_PROFILE
@@ -163,12 +165,22 @@ struct vkdnnContext
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     uint32_t family = 0;
-    bool asynchronous = false;
+    bool asynchronous = true;
     size_t nextSubmission = 0;
     std::array<std::unique_ptr<Submission>, 32> submissions;
-#ifdef VKDNN_AUTOTUNE
-    std::map<std::array<uint32_t, 20>, uint32_t> convolutionChoices;
-#endif
+    std::array<Submission*, 16> queuedSubmissions{};
+    uint32_t queuedSubmissionCount = 0;
+    VkPipeline recordingPipeline = VK_NULL_HANDLE;
+    struct ConvolutionChoice
+    {
+        uint32_t candidate = 1;
+        std::map<uint32_t, double> microseconds;
+    };
+    std::map<std::array<uint32_t, 20>, ConvolutionChoice> convolutionChoices;
+    VkQueryPool tuningQueries = VK_NULL_HANDLE;
+    uint64_t tuningTimestampMask = 0;
+    double tuningMicroseconds = 0;
+    bool tuning = false;
     vkdnnMemory staging;
     vkdnnMemory reduction;
     vkdnnMemory_t convolutionPartial = nullptr;
@@ -184,6 +196,7 @@ struct vkdnnContext
         {
             for (auto& submission : submissions) { submission.reset(); }
             compute.clear();
+            if (tuningQueries) { vkDestroyQueryPool(device, tuningQueries, nullptr); }
             if (staging.buffer) { vkDestroyBuffer(device, staging.buffer, nullptr); }
             if (staging.allocation) { vkFreeMemory(device, staging.allocation, nullptr); }
             if (reduction.buffer) { vkDestroyBuffer(device, reduction.buffer, nullptr); }
@@ -198,6 +211,37 @@ struct vkdnnContext
 
 }    //namespace vkdnnRuntime
 using namespace vkdnnRuntime;
+
+static vkdnnError_t flushSubmissions(vkdnnHandle_t context)
+{
+    if (!context->queuedSubmissionCount) { return vkdnnSuccess; }
+    VkCommandBuffer command = context->queuedSubmissions[0]->command;
+    VkFence fence = context->queuedSubmissions[0]->fence;
+    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    auto result = vkEndCommandBuffer(command);
+    if (result == VK_ERROR_DEVICE_LOST) { return vkdnnErrorDeviceLost; }
+    if (result != VK_SUCCESS) { return vkdnnErrorUnknown; }
+    result = vkResetFences(context->device, 1, &fence);
+    if (result == VK_ERROR_DEVICE_LOST) { return vkdnnErrorDeviceLost; }
+    if (result != VK_SUCCESS) { return vkdnnErrorUnknown; }
+    VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command;
+    result = vkQueueSubmit(context->queue, 1, &submit, fence);
+    if (result == VK_ERROR_DEVICE_LOST) { return vkdnnErrorDeviceLost; }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) { return vkdnnErrorMemoryAllocation; }
+    if (result != VK_SUCCESS) { return vkdnnErrorUnknown; }
+    for (uint32_t index = 0; index < context->queuedSubmissionCount; ++index)
+    {
+        context->queuedSubmissions[index]->completionFence = fence;
+    }
+    context->queuedSubmissionCount = 0;
+    return vkdnnSuccess;
+}
 
 static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory, uint32_t bufferCount,
     const uint32_t* code, size_t codeSize, const void* params, uint32_t paramSize, uint32_t groups, uint32_t groupsY)
@@ -356,9 +400,18 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
         submission = slot.get();
         if (submission->pending)
         {
-            result = vkWaitForFences(r.device, 1, &submission->fence, VK_TRUE, UINT64_MAX);
+            result = vkWaitForFences(r.device, 1, &submission->completionFence, VK_TRUE, UINT64_MAX);
             if (result != VK_SUCCESS) { return status(result); }
-            submission->pending = false;
+            for (auto& completed : context->submissions)
+            {
+                if (completed && completed->pending && completed->completionFence == submission->completionFence)
+                {
+                    completed->pending = false;
+#ifdef VKDNN_PROFILE
+                    completed->collect();
+#endif
+                }
+            }
         }
 #ifdef VKDNN_PROFILE
         submission->collect();
@@ -395,6 +448,7 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
         commandPool = submission->pool;
         command = submission->command;
         fence = submission->fence;
+        if (context->queuedSubmissionCount) { command = context->queuedSubmissions[0]->command; }
     }
     VkDescriptorBufferInfo buffers[4]{};
     VkWriteDescriptorSet writes[4]{};
@@ -409,23 +463,25 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
         writes[i].pBufferInfo = &buffers[i];
     }
     vkUpdateDescriptorSets(r.device, bufferCount, writes, 0, nullptr);
-    result = vkResetCommandPool(r.device, commandPool, 0);
-    if (result != VK_SUCCESS)
+    if (!submission || !context->queuedSubmissionCount)
     {
-        return status(result);
-    }
-    VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    result = vkBeginCommandBuffer(command, &begin);
-    if (result != VK_SUCCESS)
-    {
-        return status(result);
+        result = vkResetCommandPool(r.device, commandPool, 0);
+        if (result != VK_SUCCESS) { return status(result); }
+        VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        result = vkBeginCommandBuffer(command, &begin);
+        if (result != VK_SUCCESS) { return status(result); }
+        context->recordingPipeline = VK_NULL_HANDLE;
     }
     VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipeline);
+    if (context->recordingPipeline != r.pipeline)
+    {
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipeline);
+        context->recordingPipeline = r.pipeline;
+    }
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, r.layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(command, r.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, paramSize, params);
 #ifdef VKDNN_PROFILE
@@ -435,18 +491,38 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
         vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, submission->queries, 0);
     }
 #endif
+    if (context->tuning && context->tuningQueries)
+    {
+        vkCmdResetQueryPool(command, context->tuningQueries, 0, 2);
+        vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, context->tuningQueries, 0);
+    }
     vkCmdDispatch(command, groups, groupsY, 1);
+    if (context->tuning && context->tuningQueries) { vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, context->tuningQueries, 1); }
 #ifdef VKDNN_PROFILE
     if (submission) { vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, submission->queries, 1); }
 #endif
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-    result = vkEndCommandBuffer(command);
-    if (result != VK_SUCCESS)
+    if (!submission)
     {
-        return status(result);
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        result = vkEndCommandBuffer(command);
+        if (result != VK_SUCCESS) { return status(result); }
+    }
+    if (submission)
+    {
+        submission->pending = true;
+        submission->completionFence = VK_NULL_HANDLE;
+#ifdef VKDNN_PROFILE
+        submission->measured = true;
+        submission->timeline = &context->timeline;
+        submission->sequence = context->timeline.submitted++;
+#endif
+        context->queuedSubmissions[context->queuedSubmissionCount++] = submission;
+        context->nextSubmission = (context->nextSubmission + 1) % context->submissions.size();
+        if (context->queuedSubmissionCount == context->queuedSubmissions.size()) { return flushSubmissions(context); }
+        return vkdnnSuccess;
     }
     result = vkResetFences(r.device, 1, &fence);
     if (result != VK_SUCCESS)
@@ -461,18 +537,16 @@ static vkdnnError_t dispatchBuffers(vkdnnHandle_t context, vkdnnMemory_t* memory
     {
         return status(result);
     }
-    if (submission)
+    result = vkWaitForFences(r.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) { return status(result); }
+    if (context->tuning && context->tuningQueries)
     {
-        submission->pending = true;
-#ifdef VKDNN_PROFILE
-        submission->measured = true;
-        submission->timeline = &context->timeline;
-        submission->sequence = context->timeline.submitted++;
-#endif
-        context->nextSubmission = (context->nextSubmission + 1) % context->submissions.size();
-        return vkdnnSuccess;
+        uint64_t ticks[2]{};
+        result = vkGetQueryPoolResults(r.device, context->tuningQueries, 0, 2, sizeof(ticks), ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (result != VK_SUCCESS) { return status(result); }
+        context->tuningMicroseconds += double((ticks[1] - ticks[0]) & context->tuningTimestampMask) * properties.limits.timestampPeriod / 1000;
     }
-    return status(vkWaitForFences(r.device, 1, &fence, VK_TRUE, UINT64_MAX));
+    return vkdnnSuccess;
 }
 
 vkdnnError_t vkdnnRuntime::activationBackwardBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t y,
@@ -505,6 +579,18 @@ vkdnnError_t vkdnnRuntime::computeBuffers(vkdnnHandle_t context, vkdnnMemory_t x
 static vkdnnError_t convolutionCandidate(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t w, vkdnnMemory_t y, const ConvolutionParams& params, uint32_t splits)
 {
     vkdnnMemory_t buffers[] = { x, w, y };
+    bool tiledFilter = params.op == 2 && splits == 128;
+    bool channelTile = params.op == 2 && splits >= 256 && splits <= 258;
+    if (tiledFilter) { splits = 8; }
+    if (channelTile)
+    {
+        if (splits == 257) { splits = 8; }
+        else if (splits == 258) { splits = 64; }
+        else
+        {
+            splits = 32;
+        }
+    }
     if (params.op == 1 && splits == 2)
     {
         auto specialized = params;
@@ -528,22 +614,44 @@ static vkdnnError_t convolutionCandidate(vkdnnHandle_t context, vkdnnMemory_t x,
         }
         auto partialParams = params;
         partialParams.op = 7;
+        if (tiledFilter) { partialParams.op = 11; }
+        if (channelTile) { partialParams.op = 12; }
         if (params.op == 3) { partialParams.op = 9; }
         partialParams.nan = splits;
         partialParams.cOffset = 0;
         vkdnnMemory_t partialBuffers[] = { x, w, context->convolutionPartial };
+        uint32_t partialGroups = params.count * splits;
+        if (tiledFilter) { partialGroups /= 3; }
+        if (channelTile) { partialGroups = ((params.k + 3) / 4) * params.fc * 3 * splits; }
         auto status = dispatchBuffers(context, partialBuffers, 3, convolutionSpirv, sizeof(convolutionSpirv),
-            &partialParams, sizeof(partialParams), params.count * splits, 1);
+            &partialParams, sizeof(partialParams), partialGroups, 1);
         if (status != vkdnnSuccess) { return status; }
         auto finalParams = params;
         finalParams.op = 8;
         finalParams.nan = splits;
         finalParams.aOffset = 0;
         vkdnnMemory_t finalBuffers[] = { context->convolutionPartial, w, y };
+        uint32_t mergeGroups = (params.count + 63u) / 64u, mergeGroupsY = 1;
+        if (splits >= 32)
+        {
+            mergeGroups = params.count;
+            uint32_t limit = context->properties.limits.maxComputeWorkGroupCount[0];
+            if (mergeGroups > limit)
+            {
+                mergeGroupsY = (mergeGroups - 1) / limit + 1;
+                mergeGroups = limit;
+            }
+        }
         return dispatchBuffers(context, finalBuffers, 3, convolutionSpirv, sizeof(convolutionSpirv),
-            &finalParams, sizeof(finalParams), (params.count + 63u) / 64u, 1);
+            &finalParams, sizeof(finalParams), mergeGroups, mergeGroupsY);
     }
     uint32_t groups = (params.count + 63u) / 64u, groupsY = 1;
+    if (params.op == 4 && params.mode == 0 && params.kh == 2 && params.kw == 2
+        && params.sh == 2 && params.sw == 2 && params.ph == 0 && params.pw == 0)
+    {
+        uint32_t windows = (params.count / (params.h * params.w)) * ((params.h + 1) / 2) * ((params.w + 1) / 2);
+        groups = (windows + 63u) / 64u;
+    }
     if ((params.op == 2 || params.op == 3) && params.count <= 65535) { groups = params.count; }
     if (params.op == 6)
     {
@@ -560,25 +668,56 @@ static vkdnnError_t convolutionCandidate(vkdnnHandle_t context, vkdnnMemory_t x,
     return dispatchBuffers(context, buffers, 3, convolutionSpirv, sizeof(convolutionSpirv), &params, sizeof(params), groups, groupsY);
 }
 
-vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t w, vkdnnMemory_t y, const ConvolutionParams& params)
+vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory_t x, vkdnnMemory_t w, vkdnnMemory_t y, const ConvolutionParams& params,
+    std::vector<std::pair<uint32_t, double>>* timings)
 {
+    if (!timings)
+    {
+        uint32_t candidate = 1;
+        if ((params.op == 1 || params.op == 2) && params.nan) { candidate = params.nan; }
+        if (params.op == 3 && params.count <= 256 && uint64_t(params.n) * params.oh * params.ow >= 8192)
+        {
+            candidate = 32;
+            if (params.count <= 8 && uint64_t(params.n) * params.oh * params.ow >= 65536) { candidate = 64; }
+        }
+        return convolutionCandidate(context, x, w, y, params, candidate);
+    }
     uint64_t length = params.n * uint64_t(params.oh) * params.ow;
     uint32_t splits = 1;
-    if (params.count <= 256 && ((params.op == 2 && length >= 8192) || (params.op == 3 && length >= 32768))) { splits = 32; }
-#ifdef VKDNN_AUTOTUNE
+    if (params.count <= 256 && (params.op == 2 || params.op == 3) && length >= 8192) { splits = 32; }
     bool specializedData = params.op == 1 && params.kh == 3 && params.kw == 3
         && params.sh == 1 && params.sw == 1 && params.dh == 1 && params.dw == 1
         && params.ph == 0 && params.pw == 0 && params.groups == 1 && params.mode == 1
         && params.h >= 3 && params.w >= 3 && params.oh == params.h - 2 && params.ow == params.w - 2;
-    if ((((params.op == 2 || params.op == 3) && params.count <= 65535) || specializedData) && params.alpha != 0)
+    if ((params.op == 1 || params.op == 2 || params.op == 3) && params.alpha != 0)
     {
         std::array<uint32_t, 20> key{ params.count, params.c, params.h, params.w, params.k, params.fc,
             params.kh, params.kw, params.oh, params.ow, params.ph, params.pw, params.sh, params.sw,
             params.dh, params.dw, params.groups, params.mode, params.op, params.n };
         auto found = context->convolutionChoices.find(key);
-        if (found != context->convolutionChoices.end()) { splits = found->second; }
+        if (found != context->convolutionChoices.end()) { splits = found->second.candidate; }
         else
         {
+            if (!context->tuningQueries)
+            {
+                uint32_t familyCount = 0;
+                vkGetPhysicalDeviceQueueFamilyProperties(context->physical, &familyCount, nullptr);
+                std::vector<VkQueueFamilyProperties> families(familyCount);
+                vkGetPhysicalDeviceQueueFamilyProperties(context->physical, &familyCount, families.data());
+                uint32_t bits = families[context->family].timestampValidBits;
+                if (bits)
+                {
+                    VkQueryPoolCreateInfo query{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+                    query.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                    query.queryCount = 2;
+                    auto result = vkCreateQueryPool(context->device, &query, nullptr, &context->tuningQueries);
+                    if (result == VK_ERROR_DEVICE_LOST) { return vkdnnErrorDeviceLost; }
+                    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) { return vkdnnErrorMemoryAllocation; }
+                    if (result != VK_SUCCESS) { return vkdnnErrorUnknown; }
+                    context->tuningTimestampMask = UINT64_MAX >> (64 - bits);
+                }
+            }
+            vkdnnContext::ConvolutionChoice choice;
             vkdnnMemory_t temporary = nullptr;
             auto status = allocateMemory(context, &temporary, y->size);
             if (status != vkdnnSuccess) { return status; }
@@ -588,10 +727,26 @@ vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory
             std::vector<float> reference(params.count), actual(params.count);
             double fastest = std::numeric_limits<double>::max();
             std::vector<uint32_t> candidates{ 1, 8, 32, 64 };
+            if (params.op == 1) { candidates = { 1 }; }
             if (specializedData) { candidates = { 1, 2 }; }
+            if (params.op == 2 && params.kh == 3 && params.kw == 3 && params.sh == 1 && params.sw == 1
+                && params.dh == 1 && params.dw == 1 && params.ph == 0 && params.pw == 0
+                && params.groups == 1 && params.mode == 1 && params.h >= 3 && params.w >= 3
+                && params.oh == params.h - 2 && params.ow == params.w - 2)
+            {
+                candidates.push_back(128);
+                candidates.push_back(256);
+                candidates.push_back(257);
+                candidates.push_back(258);
+            }
             for (uint32_t candidate : candidates)
             {
-                if (!specializedData && uint64_t(params.count) * candidate > context->properties.limits.maxComputeWorkGroupCount[0]) { continue; }
+                uint64_t candidateGroups = uint64_t(params.count) * candidate;
+                if (params.op == 2 && candidate == 128) { candidateGroups = uint64_t(params.count) / 3 * 8; }
+                if (params.op == 2 && candidate == 256) { candidateGroups = uint64_t((params.k + 3) / 4) * params.fc * 3 * 32; }
+                if (params.op == 2 && candidate == 257) { candidateGroups = uint64_t((params.k + 3) / 4) * params.fc * 3 * 8; }
+                if (params.op == 2 && candidate == 258) { candidateGroups = uint64_t((params.k + 3) / 4) * params.fc * 3 * 64; }
+                if (params.op != 1 && candidate != 1 && candidateGroups > context->properties.limits.maxComputeWorkGroupCount[0]) { continue; }
                 status = convolutionCandidate(context, x, w, temporary, trial, candidate);
                 if (status != vkdnnSuccess) { break; }
                 status = copyDtoH(context, actual.data(), temporary, size_t(params.cOffset) * sizeof(float), actual.size() * sizeof(float));
@@ -609,8 +764,12 @@ vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory
                     continue;
                 }
                 double best = std::numeric_limits<double>::max();
+                bool asynchronous = context->asynchronous;
+                context->asynchronous = false;
+                context->tuning = true;
                 for (int repeat = 0; repeat < 3; ++repeat)
                 {
+                    context->tuningMicroseconds = 0;
                     auto start = std::chrono::steady_clock::now();
                     for (int iteration = 0; iteration < 4; ++iteration)
                     {
@@ -620,9 +779,13 @@ vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory
                     if (status == vkdnnSuccess) { status = synchronizeContext(context); }
                     if (status != vkdnnSuccess) { break; }
                     double microseconds = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 4;
+                    if (context->tuningQueries) { microseconds = context->tuningMicroseconds / 4; }
                     if (microseconds < best) { best = microseconds; }
                 }
+                context->tuning = false;
+                context->asynchronous = asynchronous;
                 if (status != vkdnnSuccess) { break; }
+                choice.microseconds.emplace(candidate, best);
                 std::fprintf(stderr, "VKAUTOTUNE,candidate,op=%u,n=%u,c=%u,h=%u,w=%u,k=%u,count=%u,splits=%u,us=%.3f\n",
                     params.op, params.n, params.c, params.h, params.w, params.k, params.count, candidate, best);
                 if (best < fastest)
@@ -634,13 +797,19 @@ vkdnnError_t vkdnnRuntime::convolutionBuffers(vkdnnHandle_t context, vkdnnMemory
             auto released = freeMemory(context, temporary);
             if (status != vkdnnSuccess) { return status; }
             if (released != vkdnnSuccess) { return released; }
-            context->convolutionChoices.emplace(key, splits);
+            choice.candidate = splits;
+            context->convolutionChoices.emplace(key, std::move(choice));
             std::fprintf(stderr, "VKAUTOTUNE,selected,op=%u,n=%u,c=%u,h=%u,w=%u,k=%u,count=%u,splits=%u,us=%.3f\n",
                 params.op, params.n, params.c, params.h, params.w, params.k, params.count, splits, fastest);
         }
+        const auto& choice = context->convolutionChoices.at(key);
+        timings->assign(choice.microseconds.begin(), choice.microseconds.end());
+        std::sort(timings->begin(), timings->end(), [](const auto& first, const auto& second)
+            {
+                return first.second < second.second;
+            });
     }
-#endif
-    return convolutionCandidate(context, x, w, y, params, splits);
+    return vkdnnSuccess;
 }
 
 vkdnnError_t vkdnnRuntime::gemmBuffers(vkdnnHandle_t context, vkdnnMemory_t a, vkdnnMemory_t b, vkdnnMemory_t c, const GemmParams& params)
@@ -826,7 +995,7 @@ void releaseBuffer(vkdnnHandle_t handle, vkdnnMemory& memory)
 }
 
 vkdnnStatus_t allocateBuffer(vkdnnHandle_t handle, VkDeviceSize bytes,
-    VkMemoryPropertyFlags flags, vkdnnMemory& memory)
+    VkMemoryPropertyFlags flags, vkdnnMemory& memory, VkMemoryPropertyFlags preferredFlags = 0)
 {
     VkBufferCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -846,8 +1015,12 @@ vkdnnStatus_t allocateBuffer(vkdnnHandle_t handle, VkDeviceSize bytes,
         if ((requirements.memoryTypeBits & (1u << i))
             && (properties.memoryTypes[i].propertyFlags & flags) == flags)
         {
-            type = i;
-            break;
+            if (type == properties.memoryTypeCount) { type = i; }
+            if ((properties.memoryTypes[i].propertyFlags & preferredFlags) == preferredFlags)
+            {
+                type = i;
+                break;
+            }
         }
     }
     if (type == properties.memoryTypeCount)
@@ -877,9 +1050,10 @@ bool validRange(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset, size_
         && offset <= memory->size && bytes <= memory->size - offset;
 }
 
-vkdnnStatus_t copyBuffer(vkdnnHandle_t handle, VkBuffer dst, VkDeviceSize dstOffset,
-    VkBuffer src, VkDeviceSize srcOffset, VkDeviceSize bytes)
+vkdnnStatus_t copyBufferRegions(vkdnnHandle_t handle, VkBuffer dst, VkBuffer src, uint32_t count, const VkBufferCopy* regions)
 {
+    auto status = flushSubmissions(handle);
+    if (status != vkdnnSuccess) { return status; }
     VkResult result = vkResetCommandPool(handle->device, handle->pool, 0);
     if (result != VK_SUCCESS) { return resultStatus(result); }
     VkCommandBufferBeginInfo begin{};
@@ -893,8 +1067,7 @@ vkdnnStatus_t copyBuffer(vkdnnHandle_t handle, VkBuffer dst, VkDeviceSize dstOff
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(handle->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-    VkBufferCopy region{ srcOffset, dstOffset, bytes };
-    vkCmdCopyBuffer(handle->command, src, dst, 1, &region);
+    vkCmdCopyBuffer(handle->command, src, dst, count, regions);
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(handle->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -913,6 +1086,13 @@ vkdnnStatus_t copyBuffer(vkdnnHandle_t handle, VkBuffer dst, VkDeviceSize dstOff
 }
 
 // A padded staging range preserves neighboring bytes for unaligned transfers.
+vkdnnStatus_t copyBuffer(vkdnnHandle_t handle, VkBuffer dst, VkDeviceSize dstOffset,
+    VkBuffer src, VkDeviceSize srcOffset, VkDeviceSize bytes)
+{
+    VkBufferCopy region{ srcOffset, dstOffset, bytes };
+    return copyBufferRegions(handle, dst, src, 1, &region);
+}
+
 vkdnnStatus_t transfer(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset,
     void* host, size_t bytes, bool upload)
 {
@@ -929,7 +1109,7 @@ vkdnnStatus_t transfer(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset
     if (staging.size < end - start)
     {
         releaseBuffer(handle, staging);
-        status = allocateBuffer(handle, end - start, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, staging);
+        status = allocateBuffer(handle, end - start, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, staging, VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
         if (status != VKDNN_STATUS_SUCCESS) { return status; }
     }
     if (!upload || start != offset || end != offset + bytes)
@@ -1133,9 +1313,38 @@ vkdnnStatus_t vkdnnRuntime::createContext(vkdnnHandle_t* handle, int device)
     }
 }
 
+#ifdef VKDNN_REDUCE_SAMPLE
+struct ReductionSamples
+{
+    struct Entry
+    {
+        uint64_t calls = 0, samples = 0;
+        std::array<double, 5> microseconds{};
+    };
+    std::map<std::pair<uint32_t, uint32_t>, Entry> entries;
+    ~ReductionSamples()
+    {
+        for (const auto& item : entries)
+        {
+            const auto& entry = item.second;
+            std::fprintf(stderr, "REDUCESAMPLE,%u,%u,%llu,%llu,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                item.first.first, item.first.second, static_cast<unsigned long long>(entry.calls),
+                static_cast<unsigned long long>(entry.samples), entry.microseconds[0], entry.microseconds[1],
+                entry.microseconds[2], entry.microseconds[3], entry.microseconds[4]);
+        }
+    }
+};
+#endif
 vkdnnError_t vkdnnRuntime::reduceBuffers(vkdnnHandle_t handle, vkdnnMemory_t first, vkdnnMemory_t second,
     float* output, const GemmParams& params)
 {
+#ifdef VKDNN_REDUCE_SAMPLE
+    static thread_local ReductionSamples statistics;
+    auto& sample = statistics.entries[{ params.transa, params.k }];
+    bool measured = (++sample.calls % 64) == 1;
+    std::array<std::chrono::steady_clock::time_point, 6> timestamps{};
+    if (measured) { timestamps[0] = std::chrono::steady_clock::now(); }
+#endif
     auto& reduction = handle->reduction;
     if (!reduction.buffer)
     {
@@ -1144,23 +1353,48 @@ vkdnnError_t vkdnnRuntime::reduceBuffers(vkdnnHandle_t handle, vkdnnMemory_t fir
     }
     auto status = gemmBuffers(handle, first, second, &reduction, params);
     if (status != vkdnnSuccess) { return status; }
+#ifdef VKDNN_REDUCE_SAMPLE
+    if (measured) { timestamps[1] = std::chrono::steady_clock::now(); }
+#endif
     if (handle->asynchronous)
     {
         size_t last = (handle->nextSubmission + handle->submissions.size() - 1) % handle->submissions.size();
         auto& submission = *handle->submissions[last];
-        status = resultStatus(vkWaitForFences(handle->device, 1, &submission.fence, VK_TRUE, UINT64_MAX));
+        status = flushSubmissions(handle);
+        if (status != vkdnnSuccess) { return status; }
+#ifdef VKDNN_REDUCE_SAMPLE
+        if (measured) { timestamps[2] = std::chrono::steady_clock::now(); }
+#endif
+        status = resultStatus(vkWaitForFences(handle->device, 1, &submission.completionFence, VK_TRUE, UINT64_MAX));
         if (status != vkdnnSuccess) { return status; }
         submission.pending = false;
     }
+#ifdef VKDNN_REDUCE_SAMPLE
+    if (measured) { timestamps[3] = std::chrono::steady_clock::now(); }
+#endif
     void* mapped = nullptr;
     auto result = vkMapMemory(handle->device, reduction.allocation, 0, VK_WHOLE_SIZE, 0, &mapped);
     if (result != VK_SUCCESS) { return resultStatus(result); }
+#ifdef VKDNN_REDUCE_SAMPLE
+    if (measured) { timestamps[4] = std::chrono::steady_clock::now(); }
+#endif
     VkMappedMemoryRange range{ VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
     range.memory = reduction.allocation;
     range.size = VK_WHOLE_SIZE;
     result = vkInvalidateMappedMemoryRanges(handle->device, 1, &range);
     if (result == VK_SUCCESS) { std::memcpy(output, mapped, sizeof(float)); }
     vkUnmapMemory(handle->device, reduction.allocation);
+#ifdef VKDNN_REDUCE_SAMPLE
+    if (measured && handle->asynchronous)
+    {
+        timestamps[5] = std::chrono::steady_clock::now();
+        ++sample.samples;
+        for (size_t stage = 0; stage < sample.microseconds.size(); ++stage)
+        {
+            sample.microseconds[stage] += std::chrono::duration<double, std::micro>(timestamps[stage + 1] - timestamps[stage]).count();
+        }
+    }
+#endif
     return resultStatus(result);
 }
 
@@ -1189,6 +1423,8 @@ vkdnnError_t vkdnnRuntime::setExecutionMode(vkdnnHandle_t handle, vkdnnExecution
 vkdnnStatus_t vkdnnRuntime::synchronizeContext(vkdnnHandle_t handle)
 {
     if (!handle) { return VKDNN_STATUS_INVALID_VALUE; }
+    auto status = flushSubmissions(handle);
+    if (status != vkdnnSuccess) { return status; }
     auto result = vkDeviceWaitIdle(handle->device);
 #ifdef VKDNN_PROFILE
     if (result == VK_SUCCESS)
@@ -1275,6 +1511,14 @@ vkdnnStatus_t vkdnnRuntime::copyDtoD(vkdnnHandle_t handle, vkdnnMemory_t dst, si
         if (status != VKDNN_STATUS_SUCCESS) { return status; }
         return transfer(handle, dst, dstOffset, host.data(), bytes, true);
     } catch (const std::bad_alloc&) { return VKDNN_STATUS_OUT_OF_MEMORY; }
+}
+
+vkdnnStatus_t vkdnnRuntime::copyDtoD2D(vkdnnHandle_t handle, vkdnnMemory_t dst, size_t dstOffset, size_t dstPitch,
+    vkdnnMemory_t src, size_t srcOffset, size_t srcPitch, size_t width, size_t height)
+{
+    std::vector<VkBufferCopy> regions(height);
+    for (size_t row = 0; row < height; ++row) { regions[row] = { srcOffset + row * srcPitch, dstOffset + row * dstPitch, width }; }
+    return copyBufferRegions(handle, dst->buffer, src->buffer, static_cast<uint32_t>(height), regions.data());
 }
 
 vkdnnStatus_t vkdnnRuntime::setMemory(vkdnnHandle_t handle, vkdnnMemory_t memory, size_t offset, int value, size_t bytes)

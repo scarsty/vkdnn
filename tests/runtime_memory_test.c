@@ -77,6 +77,18 @@ int main(void)
     OK(vkdnnMemcpy(output, input, sizeof(output), vkdnnMemcpyDefault));
     INVALID(vkdnnMemcpy(output + 1, output, 3, vkdnnMemcpyHostToHost));
     OK(vkdnnDeviceSynchronize());
+    OK(vkdnnMemcpy2D(b + 8, 32, a + 4, 24, 12, 7, vkdnnMemcpyDeviceToDevice));
+    for (size_t row = 0; row < 7; ++row) { memcpy(expected + 8 + row * 32, input + 4 + row * 24, 12); }
+    OK(vkdnnMemcpy(output, b, sizeof(output), vkdnnMemcpyDeviceToHost));
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    INVALID(vkdnnMemcpy2D(b, 8, a, 24, 12, 7, vkdnnMemcpyDeviceToDevice));
+    INVALID(vkdnnMemcpy2D(b, 32, a, 24, 12, SIZE_MAX, vkdnnMemcpyDeviceToDevice));
+    INVALID(vkdnnMemcpy2D(b + 1024, 32, a, 24, 12, 2, vkdnnMemcpyDeviceToDevice));
+    INVALID(vkdnnMemcpy2D(b + 8, 32, b, 24, 12, 7, vkdnnMemcpyDeviceToDevice));
+    CHECK(vkdnnMemcpy2D(b + 1, 32, a, 24, 12, 7, vkdnnMemcpyDeviceToDevice) == vkdnnErrorNotSupported);
+    OK(vkdnnMemcpy2D(NULL, 0, NULL, 0, 0, 7, vkdnnMemcpyDeviceToDevice));
+    OK(vkdnnMemcpy(output, b, sizeof(output), vkdnnMemcpyDeviceToHost));
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
     if (count > 1)
     {
         void* other = NULL;

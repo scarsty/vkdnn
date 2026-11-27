@@ -440,7 +440,7 @@ int main()
     std::puts("PASS: convolution dx/dw/db CPU reference, CPU/GPU finite differences, groups/depthwise/flip/stride/dilation/padding, scalars, overflow and ranges");
     for (int mode = 0; mode < 3; ++mode)
     {
-        for (int config = 0; config < 3; ++config)
+        for (int config = 0; config < 5; ++config)
         {
             int n = 2, c = 2, h = 4, w = 5, kh = 2, kw = 3, ph = 1, pw = 1, sh = 1, sw = 2;
             if (config == 1)
@@ -460,6 +460,13 @@ int main()
                 pw = 0;
                 sh = 2;
                 sw = 3;
+            }
+            if (config >= 3)
+            {
+                h = config == 3 ? 4 : 5;
+                w = h;
+                kh = kw = sh = sw = 2;
+                ph = pw = 0;
             }
             int oh = (h + 2 * ph - kh) / sh + 1, ow = (w + 2 * pw - kw) / sw + 1, xs = n * c * h * w, ys = n * c * oh * ow;
             set(xd, n, c, h, w);
@@ -673,6 +680,52 @@ int main()
                 REQUIRE(std::isnan(v));
             }
         }
+    }
+    set(xd, 1, 1, 2, 2);
+    set(yd, 1, 1, 1, 1);
+    for (int nan = 0; nan < 2; ++nan)
+    {
+        OK(vkdnnSetPooling2dDescriptor(pd, VKDNN_POOLING_MAX, vkdnnNanPropagation_t(nan), 2, 2, 0, 0, 2, 2));
+        Buffer x(4), y(1), dy(1), dx(4);
+        y.put({ 3 });
+        dy.put({ 3 });
+        float alpha = 1, beta = 0;
+        auto run = [&]()
+        {
+            OK(vkdnnPoolingBackward(handle, pd, &alpha, yd, y.p, yd, dy.p, xd, x.p, &beta, xd, dx.p));
+        };
+        for (float value : { 2.0f, -INFINITY })
+        {
+            x.put({ value, value, value, value });
+            dx.put({ NAN, NAN, NAN, NAN });
+            run();
+            check(dx.get(), { 3, 0, 0, 0 }, 1, 0);
+        }
+        x.put({ NAN, 2, 1, 0 });
+        run();
+        if (nan)
+        {
+            for (float value : dx.get()) { REQUIRE(std::isnan(value)); }
+        }
+        else
+        {
+            check(dx.get(), { 0, 3, 0, 0 }, 1, 0);
+        }
+        x.put({ NAN, NAN, NAN, NAN });
+        run();
+        if (nan)
+        {
+            for (float value : dx.get()) { REQUIRE(std::isnan(value)); }
+        }
+        else
+        {
+            check(dx.get(), { 0, 0, 0, 0 }, 1, 0);
+        }
+        alpha = 0;
+        beta = 0.5f;
+        dx.put({ 2, 4, 6, 8 });
+        run();
+        check(dx.get(), { 1, 2, 3, 4 }, 1, 0);
     }
     set(xd, 1, 1, 1, 1);
     set(yd, 1, 1, 1, 1);

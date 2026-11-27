@@ -6,9 +6,15 @@
 
 ## 项目定位
 
+卷积 TensorView Ex 显式接收对应方向的算法枚举；选优由独立的
+`vkdnnFindConvolutionForwardAlgorithmViewEx`、`vkdnnFindConvolutionBackwardDataAlgorithmViewEx`
+及 `vkdnnFindConvolutionBackwardFilterAlgorithmViewEx` 完成，普通执行不隐式 Find。
+卷积描述符准备由库内共享对象负责，调用方只需适配数据并缓存显式 Find 的结果。
+卷积 Ex 新增算法参数属于 ABI 变更，调用方必须同步更新后重新构建。
+
 BLAS 新增 `vkblasSasum`、`vkblasSdot`：连续或正步长 FP32 设备向量在 Vulkan compute 上归约，支持分配内偏移视图，仅回传最终 FP32 标量。当前使用单工作组共享内存归约，尚未针对大型向量优化；不做整向量 CPU 回退。
 
-`include/vkdnn/vkdnn_helpers.h` 提供独立 C ABI 便捷扩展 `vkdnnExecuteActivation`、`vkdnnExecutePooling` 和 `vkdnnExecuteConvolution`，并非 cuDNN 对应 API。调用方传入原生 DNN 句柄、连续 FP32 NCHW 的 `vkdnnTensorView`（维度、数据与可选梯度指针）及库枚举；库内管理描述符和临时设备输出。计算遵循 `alpha * result + beta * old_destination`，支持输入输出别名，成功后才复制回目标。反向需要有效梯度指针，卷积方向使用具名枚举；池化与卷积仅支持二维。调用前须将当前设备设为句柄所属设备；接口返回 DNN 状态，不泄漏 C++ 异常，不依赖 cccc。
+`include/vkdnn/vkdnn_helpers.h` 提供独立 C ABI TensorView 扩展 `vkdnnActivationForwardEx/BackwardEx`、`vkdnnPoolingForwardEx/BackwardEx` 及 `vkdnnConvolutionForwardEx/BackwardDataEx/BackwardFilterEx`。名称采用 cuDNN 风格，但这些 Ex 不是 cuDNN 同签名接口。调用方传入原生 DNN 句柄、连续 FP32 NCHW 的 `vkdnnTensorView`（维度、数据与可选梯度指针）及库枚举；库内管理描述符和临时设备输出。计算遵循 `alpha * result + beta * old_destination`，支持输入输出别名，成功后才复制回目标。反向需要有效梯度指针；池化与卷积仅支持二维。调用前须将当前设备设为句柄所属设备；接口返回 DNN 状态，不依赖 cccc。旧 Execute 接口及公开卷积方向枚举已删除，不保留二进制兼容包装，旧调用方必须迁移并重新链接。
 
 - **计算基础库，而非训练框架**：负责设备、内存、数据传输、矩阵计算和神经网络算子，不提供自动微分、优化器或模型导入。
 - **Vulkan 原生实现**：使用 Vulkan Compute 与 SPIR-V，不依赖 CUDA；不承诺 CUDA API、ABI 或执行语义兼容。
@@ -53,7 +59,7 @@ BLAS 新增 `vkblasSasum`、`vkblasSdot`：连续或正步长 FP32 设备向量�
 1. 基础运行时采用 CUDA 风格的当前设备和隐式上下文，明确设备指针生命周期与 reset 前的同步要求。
 2. 内存分配、数据传输和计算分离，避免每次算子调用隐式复制数据。
 3. 显式表达布局、数据类型与执行参数；不支持的组合返回错误，不静默改变计算语义。
-4. 默认同步执行；可通过 `vkdnnSetExecutionMode(vkdnnExecutionAsynchronous)` 显式启用当前设备的异步计算。该接口为 Vulkan 扩展，不是 CUDA 对应 API；模式由同设备各线程共享。每算子立即提交，最多32个独立在途资源槽，槽位复用可能等待；不等于集中提交或命令重放。模式切换、`vkdnnDeviceSynchronize`、同步复制、释放、reset及宿主标量归约保证完成，执行错误在完成边界返回。现有复制接口始终同步，默认计算行为不变。调用方必须协调跨线程模式切换，reset后恢复默认模式。
+4. 默认异步计算，无需调用方设置；可通过 `vkdnnSetExecutionMode(vkdnnExecutionSynchronous)` 显式切换为同步计算。该接口为 Vulkan 扩展，不是 CUDA 对应 API；模式由同设备各线程共享。最多32个独立在途资源槽，计算命令批次提交，槽位复用可能等待；不是算子融合或命令重放。模式切换、`vkdnnDeviceSynchronize`、同步复制、释放、reset及宿主标量归约保证完成，执行错误在完成边界返回。现有复制接口始终同步。调用方必须协调跨线程模式切换，reset后重建context恢复默认异步模式。
 5. 首版 buffer 使用库自身分配；外部 Vulkan device、buffer 与命令流互操作待运行时稳定后独立设计。
 6. 算子参数错误、设备能力不足、内存不足及设备丢失均需向调用者报告。
 
@@ -93,6 +99,11 @@ ctest --test-dir build -C Debug --output-on-failure
 | `vkdnnSetDevice` / `vkdnnGetDevice` / `vkdnnDeviceReset` | 选择、查询当前设备，释放当前设备全部运行时资源 |
 | `vkdnnMalloc` / `vkdnnFree` | 分配、释放上下文所属的显存 |
 | `vkdnnMemcpy(dst, src, count, kind)` | 按方向枚举同步复制；支持 HostToHost、HostToDevice、DeviceToHost、DeviceToDevice、Default |
+| `vkdnnMemcpy2D(dst, dpitch, src, spitch, width, height, kind)` | 同设备同步二维 D2D；支持 DeviceToDevice/Default，所有行区域在一次 GPU 提交中复制 |
+
+二维复制要求指针偏移、步幅及行宽为 4 字节对齐，暂不支持主机传输或非对齐区域；
+容量、步幅、整数溢出和源/目标包围范围重叠在提交前校验。API 参数形式参考 CUDA Runtime 的 cudaMemcpy2D，
+但上述支持范围限制不等同于 CUDA 的全部能力。
 | `vkdnnMemset` / `vkdnnDeviceSynchronize` | 按字节填充、等待设备执行完成 |
 | `vkdnnGetErrorString` | 获取状态码对应的静态错误字符串（已实现） |
 

@@ -28,7 +28,7 @@ typedef enum vkblasPointerMode_t
     VKBLAS_POINTER_MODE_DEVICE = 1
 } vkblasPointerMode_t;
 /* cuBLAS-style column-major matrices; scalar pointer mode defaults to HOST.
- * FP32 Vulkan GEMM; completion follows vkdnnSetExecutionMode (synchronous by default).
+ * FP32 Vulkan GEMM; completion follows vkdnnSetExecutionMode (asynchronous by default).
  * Real OP_C is OP_T. Leading dimensions include padding.
  * DEVICE pointer mode returns NOT_SUPPORTED and leaves HOST mode unchanged.
  * Handles bind the current device. Caller serializes handle access/destruction.

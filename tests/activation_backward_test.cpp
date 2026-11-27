@@ -64,16 +64,16 @@ int main()
         RT(vkdnnMemcpy(data, values, sizeof(values), vkdnnMemcpyHostToDevice));
         RT(vkdnnMemcpy(gradient, gradients, sizeof(gradients), vkdnnMemcpyHostToDevice));
         vkdnnTensorView view{ 1, 1, 1, 2, data, gradient };
-        OK(vkdnnExecuteActivation(handle, view, view, VKDNN_HELPER_RELU, 2, 1, 0));
+        OK(vkdnnActivationForwardEx(handle, view, view, VKDNN_HELPER_RELU, 2, 1));
         RT(vkdnnMemcpy(values, data, sizeof(values), vkdnnMemcpyDeviceToHost));
         compare(values[0], -2);
         compare(values[1], 9);
-        OK(vkdnnExecuteActivation(handle, view, view, VKDNN_HELPER_RELU, 2, 1, 1));
+        OK(vkdnnActivationBackwardEx(handle, view, view, VKDNN_HELPER_RELU, 2, 1));
         RT(vkdnnMemcpy(gradients, gradient, sizeof(gradients), vkdnnMemcpyDeviceToHost));
         compare(gradients[0], 4);
         compare(gradients[1], 15);
-        REQUIRE(vkdnnExecuteActivation(handle, view, view, VKDNN_HELPER_RELU, 1, 0, 2) == VKDNN_STATUS_BAD_PARAM);
-        REQUIRE(vkdnnExecuteActivation(handle, view, view, static_cast<vkdnnActivationKind>(99), 1, 0, 0) == VKDNN_STATUS_NOT_SUPPORTED);
+        REQUIRE(vkdnnActivationForwardEx(handle, {}, view, VKDNN_HELPER_RELU, 1, 0) == VKDNN_STATUS_BAD_PARAM);
+        REQUIRE(vkdnnActivationForwardEx(handle, view, view, static_cast<vkdnnActivationKind>(99), 1, 0) == VKDNN_STATUS_NOT_SUPPORTED);
         RT(vkdnnFree(gradient));
         RT(vkdnnFree(data));
         std::puts("Execution helpers aliasing, accumulation and invalid parameters passed");
@@ -94,8 +94,12 @@ int main()
                 vkdnnTensorView input{ 1, 1, 1, 2, allocation[0], destination };
                 vkdnnTensorView weights{ 1, 1, 1, 1, allocation[1], destination };
                 vkdnnTensorView output{ 1, 1, 1, 2, destination, allocation[2] };
-                OK(vkdnnExecuteConvolution(handle, input, weights, output, 1, 1, 0, 0, 2, 0.5f,
-                    static_cast<vkdnnConvolutionDirection>(direction)));
+                if (direction == 0) { OK(vkdnnConvolutionForwardEx(handle, input, weights, output, 1, 1, 0, 0, 2, 0.5f, VKDNN_CONVOLUTION_FWD_ALGO_DIRECT)); }
+                else if (direction == 1) { OK(vkdnnConvolutionBackwardDataEx(handle, input, weights, output, 1, 1, 0, 0, 2, 0.5f, VKDNN_CONVOLUTION_BWD_DATA_ALGO_0)); }
+                else
+                {
+                    OK(vkdnnConvolutionBackwardFilterEx(handle, input, weights, output, 1, 1, 0, 0, 2, 0.5f, VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0));
+                }
                 float actual[2]{};
                 RT(vkdnnMemcpy(actual, destination, sizeof(actual), vkdnnMemcpyDeviceToHost));
                 double priorFirst = alias ? 2 : 11;
@@ -113,6 +117,46 @@ int main()
                 else
                 {
                     compare(actual[0], 62 + 0.5 * priorFirst);
+                }
+                if (!alias)
+                {
+                    int count = 0;
+                    if (direction == 0)
+                    {
+                        vkdnnConvolutionFwdAlgoPerf_t result{};
+                        OK(vkdnnFindConvolutionForwardAlgorithmViewEx(handle, input, weights, output, 1, 1, 0, 0, 1, &count, &result));
+                        if (count != 1 || result.status != VKDNN_STATUS_SUCCESS) { std::abort(); }
+                        OK(vkdnnConvolutionForwardEx(handle, input, weights, output, 1, 1, 0, 0, 1, 0, result.algo));
+                    }
+                    else if (direction == 1)
+                    {
+                        vkdnnConvolutionBwdDataAlgoPerf_t result{};
+                        OK(vkdnnFindConvolutionBackwardDataAlgorithmViewEx(handle, input, weights, output, 1, 1, 0, 0, 1, &count, &result));
+                        if (count != 1 || result.status != VKDNN_STATUS_SUCCESS) { std::abort(); }
+                        OK(vkdnnConvolutionBackwardDataEx(handle, input, weights, output, 1, 1, 0, 0, 1, 0, result.algo));
+                    }
+                    else
+                    {
+                        vkdnnConvolutionBwdFilterAlgoPerf_t result{};
+                        OK(vkdnnFindConvolutionBackwardFilterAlgorithmViewEx(handle, input, weights, output, 1, 1, 0, 0, 1, &count, &result));
+                        if (count != 1 || result.status != VKDNN_STATUS_SUCCESS) { std::abort(); }
+                        OK(vkdnnConvolutionBackwardFilterEx(handle, input, weights, output, 1, 1, 0, 0, 1, 0, result.algo));
+                    }
+                    RT(vkdnnMemcpy(actual, destination, sizeof(actual), vkdnnMemcpyDeviceToHost));
+                    if (direction == 0)
+                    {
+                        compare(actual[0], 8);
+                        compare(actual[1], 12);
+                    }
+                    else if (direction == 1)
+                    {
+                        compare(actual[0], 20);
+                        compare(actual[1], 28);
+                    }
+                    else
+                    {
+                        compare(actual[0], 31);
+                    }
                 }
             }
         }
@@ -132,14 +176,14 @@ int main()
             void* destination = alias ? buffers[0] : buffers[1];
             vkdnnTensorView input{ 1, 1, 2, 2, buffers[0], buffers[3] };
             vkdnnTensorView output{ 1, 1, 1, 1, destination, buffers[2] };
-            OK(vkdnnExecutePooling(handle, input, output, VKDNN_POOLING_MAX, 2, 2, 2, 2, 0, 0, 2, 0.5f, 0));
+            OK(vkdnnPoolingForwardEx(handle, input, output, VKDNN_POOLING_MAX, 2, 2, 2, 2, 0, 0, 2, 0.5f));
             float actual[4]{};
             RT(vkdnnMemcpy(actual, destination, sizeof(float), vkdnnMemcpyDeviceToHost));
             compare(actual[0], alias ? 8.5 : 9.0);
             RT(vkdnnMemcpy(buffers[0], values, sizeof(values), vkdnnMemcpyHostToDevice));
             input.gradient = alias ? buffers[0] : buffers[3];
             output.data = buffers[1];
-            OK(vkdnnExecutePooling(handle, input, output, VKDNN_POOLING_MAX, 2, 2, 2, 2, 0, 0, 2, 0.5f, 1));
+            OK(vkdnnPoolingBackwardEx(handle, input, output, VKDNN_POOLING_MAX, 2, 2, 2, 2, 0, 0, 2, 0.5f));
             RT(vkdnnMemcpy(actual, input.gradient, sizeof(actual), vkdnnMemcpyDeviceToHost));
             for (int index = 0; index < 4; ++index)
             {

@@ -80,7 +80,7 @@ VKDNN_API vkdnnError_t vkdnnSetDevice(int device);
 VKDNN_API vkdnnError_t vkdnnGetDevice(int* device);
 VKDNN_API vkdnnError_t vkdnnDeviceSynchronize(void);
 /* Vulkan extension, not a CUDA API. Per-device and shared across threads.
- * Default is synchronous. Mode changes wait for outstanding work. Asynchronous
+ * Default is asynchronous. Mode changes wait for outstanding work. Asynchronous
  * compute uses a bounded queue and may wait for resource reuse. Copies, free,
  * reset and host scalar reductions remain completion boundaries. */
 typedef enum vkdnnExecutionMode
@@ -103,6 +103,9 @@ VKDNN_API vkdnnError_t vkdnnFree(void* devPtr);
  * are unsupported; overlapping ranges are invalid. Zero count is a no-op.
  * Failed validation preserves destination; runtime failures may partially write. */
 VKDNN_API vkdnnError_t vkdnnMemcpy(void* dst, const void* src, size_t count, enum vkdnnMemcpyKind kind);
+/* Synchronous same-device D2D pitched copy. Offsets, pitches and width must be
+ * multiples of four. Overlapping bounding ranges are rejected. */
+VKDNN_API vkdnnError_t vkdnnMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, enum vkdnnMemcpyKind kind);
 VKDNN_API vkdnnError_t vkdnnMemset(void* devPtr, int value, size_t count);
 
 #ifdef __cplusplus

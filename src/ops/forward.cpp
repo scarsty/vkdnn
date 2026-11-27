@@ -248,7 +248,7 @@ ConvolutionParams backwardParams(vkdnnTensorDescriptor_t x, vkdnnFilterDescripto
 }
 vkdnnStatus_t backwardExecute(vkdnnHandle_t handle, const void* alpha, const void* beta,
     const void* a, size_t ab, const void* b, size_t bb, void* out, size_t bytes, ConvolutionParams q,
-    const void* extra = nullptr, size_t extraBytes = 0)
+    const void* extra = nullptr, size_t extraBytes = 0, std::vector<std::pair<uint32_t, double>>* timings = nullptr)
 {
     auto s = runtimeHostScalar(static_cast<const float*>(alpha), q.alpha);
     if (s != vkdnnSuccess) { return mapStatus(s); }
@@ -260,7 +260,29 @@ vkdnnStatus_t backwardExecute(vkdnnHandle_t handle, const void* alpha, const voi
         bb = 0;
         extraBytes = 0;
     }
-    return mapStatus(runtimeConvolution(handle->device, a, ab, b, bb, out, bytes, q, extra, extraBytes));
+    return mapStatus(runtimeConvolution(handle->device, a, ab, b, bb, out, bytes, q, extra, extraBytes, timings));
+}
+bool specializedConvolution(vkdnnTensorDescriptor_t x, vkdnnFilterDescriptor_t f, vkdnnConvolutionDescriptor_t p)
+{
+    return f->h == 3 && f->w == 3 && p->sh == 1 && p->sw == 1 && p->dh == 1 && p->dw == 1
+        && p->ph == 0 && p->pw == 0 && p->groups == 1 && p->mode == VKDNN_CROSS_CORRELATION && x->h >= 3 && x->w >= 3;
+}
+bool dataAlgorithm(vkdnnConvolutionBwdDataAlgo_t algo, vkdnnTensorDescriptor_t x, vkdnnFilterDescriptor_t f, vkdnnConvolutionDescriptor_t p)
+{
+    return algo == VKDNN_CONVOLUTION_BWD_DATA_ALGO_0 || (algo == VKDNN_CONVOLUTION_BWD_DATA_ALGO_DIRECT_3X3 && specializedConvolution(x, f, p));
+}
+bool filterAlgorithm(vkdnnConvolutionBwdFilterAlgo_t algo, vkdnnTensorDescriptor_t x, vkdnnFilterDescriptor_t f, vkdnnConvolutionDescriptor_t p)
+{
+    uint64_t groups = uint64_t(f->count) * uint32_t(algo);
+    if (algo == VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0) { return true; }
+    if (algo == 8 || algo == 32 || algo == 64) { return groups <= 65535; }
+    if (!specializedConvolution(x, f, p)) { return false; }
+    if (algo == 128) { return uint64_t(f->count) / 3 * 8 <= 65535; }
+    uint32_t splits = 32;
+    if (algo == 257) { splits = 8; }
+    else if (algo == 258) { splits = 64; }
+    else if (algo != 256) { return false; }
+    return uint64_t((f->k + 3) / 4) * f->c * 3 * splits <= 65535;
 }
 }    //namespace
 
@@ -273,7 +295,7 @@ vkdnnStatus_t vkdnnGetConvolutionBackwardDataWorkspaceSize(vkdnnHandle_t handle,
             auto s = convolutionOutput(p, x, f, y);
             if (s != VKDNN_STATUS_SUCCESS) { return s; }
             if (!bytes) { return VKDNN_STATUS_BAD_PARAM; }
-            if (algo != VKDNN_CONVOLUTION_BWD_DATA_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            if (!dataAlgorithm(algo, x, f, p)) { return VKDNN_STATUS_NOT_SUPPORTED; }
             *bytes = 0;
             return VKDNN_STATUS_SUCCESS;
         });
@@ -287,7 +309,7 @@ vkdnnStatus_t vkdnnGetConvolutionBackwardFilterWorkspaceSize(vkdnnHandle_t handl
             auto s = convolutionOutput(p, x, f, y);
             if (s != VKDNN_STATUS_SUCCESS) { return s; }
             if (!bytes) { return VKDNN_STATUS_BAD_PARAM; }
-            if (algo != VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            if (!filterAlgorithm(algo, x, f, p)) { return VKDNN_STATUS_NOT_SUPPORTED; }
             *bytes = 0;
             return VKDNN_STATUS_SUCCESS;
         });
@@ -301,10 +323,11 @@ vkdnnStatus_t vkdnnConvolutionBackwardData(vkdnnHandle_t handle, const void* alp
             if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
             auto s = convolutionOutput(p, x, f, y);
             if (s != VKDNN_STATUS_SUCCESS) { return s; }
-            if (algo != VKDNN_CONVOLUTION_BWD_DATA_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            if (!dataAlgorithm(algo, x, f, p)) { return VKDNN_STATUS_NOT_SUPPORTED; }
             (void)workspace;
             (void)workspaceBytes;
             auto q = backwardParams(x, f, p, y, 1);
+            q.nan = uint32_t(algo);
             q.count = x->count;
             return backwardExecute(handle, alpha, beta, weights, size_t(f->count) * 4, dy, size_t(y->count) * 4, dx, size_t(x->count) * 4, q);
         });
@@ -318,13 +341,78 @@ vkdnnStatus_t vkdnnConvolutionBackwardFilter(vkdnnHandle_t handle, const void* a
             if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
             auto s = convolutionOutput(p, x, f, y);
             if (s != VKDNN_STATUS_SUCCESS) { return s; }
-            if (algo != VKDNN_CONVOLUTION_BWD_FILTER_ALGO_0) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            if (!filterAlgorithm(algo, x, f, p)) { return VKDNN_STATUS_NOT_SUPPORTED; }
             (void)workspace;
             (void)workspaceBytes;
             auto q = backwardParams(x, f, p, y, 2);
+            q.nan = uint32_t(algo);
             q.count = f->count;
             return backwardExecute(handle, alpha, beta, input, size_t(x->count) * 4, dy, size_t(y->count) * 4, dw, size_t(f->count) * 4, q);
         });
+}
+namespace
+{
+template <class Perf>
+vkdnnStatus_t findBackward(vkdnnHandle_t handle, vkdnnTensorDescriptor_t x, vkdnnFilterDescriptor_t f,
+    vkdnnConvolutionDescriptor_t p, vkdnnTensorDescriptor_t y, const void* first, const void* second,
+    void* destination, uint32_t operation, int requested, int* returned, Perf* results)
+{
+    return guarded([&]
+        {
+            if (!handles.count(handle)) { return VKDNN_STATUS_NOT_INITIALIZED; }
+            if (requested <= 0 || !returned || !results) { return VKDNN_STATUS_BAD_PARAM; }
+            auto status = convolutionOutput(p, x, f, y);
+            if (status != VKDNN_STATUS_SUCCESS) { return status; }
+            auto parameters = backwardParams(x, f, p, y, operation);
+            parameters.count = f->count;
+            size_t firstBytes = size_t(x->count) * sizeof(float);
+            if (operation == 1)
+            {
+                parameters.count = x->count;
+                firstBytes = size_t(f->count) * sizeof(float);
+            }
+            const float alpha = 1, beta = 0;
+            std::vector<std::pair<uint32_t, double>> timings;
+            status = backwardExecute(handle, &alpha, &beta, first, firstBytes, second, size_t(y->count) * sizeof(float),
+                destination, size_t(parameters.count) * sizeof(float), parameters, nullptr, 0, &timings);
+            if (status != VKDNN_STATUS_SUCCESS) { return status; }
+            if (timings.empty()) { return VKDNN_STATUS_NOT_SUPPORTED; }
+            int count = 0;
+            for (const auto& timing : timings)
+            {
+                if (count == requested) { break; }
+                Perf result{};
+                uint32_t algorithm = timing.first;
+                if (algorithm == 1) { algorithm = 0; }
+                result.algo = static_cast<decltype(result.algo)>(algorithm);
+                result.status = VKDNN_STATUS_SUCCESS;
+                result.time = float(timing.second / 1000);
+                result.determinism = VKDNN_DETERMINISTIC;
+                result.mathType = VKDNN_DEFAULT_MATH;
+                results[count++] = result;
+            }
+            *returned = count;
+            return VKDNN_STATUS_SUCCESS;
+        });
+}
+}    //namespace
+vkdnnStatus_t vkdnnFindConvolutionBackwardDataAlgorithmEx(vkdnnHandle_t handle,
+    vkdnnFilterDescriptor_t f, const void* weights, vkdnnTensorDescriptor_t y, const void* dy,
+    vkdnnConvolutionDescriptor_t p, vkdnnTensorDescriptor_t x, void* dx,
+    int requested, int* returned, vkdnnConvolutionBwdDataAlgoPerf_t* results, void* workspace, size_t workspaceBytes)
+{
+    (void)workspace;
+    (void)workspaceBytes;
+    return findBackward(handle, x, f, p, y, weights, dy, dx, 1, requested, returned, results);
+}
+vkdnnStatus_t vkdnnFindConvolutionBackwardFilterAlgorithmEx(vkdnnHandle_t handle,
+    vkdnnTensorDescriptor_t x, const void* input, vkdnnTensorDescriptor_t y, const void* dy,
+    vkdnnConvolutionDescriptor_t p, vkdnnFilterDescriptor_t f, void* dw,
+    int requested, int* returned, vkdnnConvolutionBwdFilterAlgoPerf_t* results, void* workspace, size_t workspaceBytes)
+{
+    (void)workspace;
+    (void)workspaceBytes;
+    return findBackward(handle, x, f, p, y, input, dy, dw, 2, requested, returned, results);
 }
 vkdnnStatus_t vkdnnConvolutionBackwardBias(vkdnnHandle_t handle, const void* alpha, vkdnnTensorDescriptor_t y,
     const void* dy, const void* beta, vkdnnTensorDescriptor_t b, void* db)

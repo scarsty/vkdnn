@@ -1,6 +1,8 @@
 #pragma once
 #include "vkdnn/vkdnn.h"
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 struct ComputeParams
 {
@@ -43,4 +45,5 @@ struct ConvolutionParams
     float gamma, delta;
 };
 vkdnnError_t runtimeConvolution(int device, const void* x, size_t xBytes, const void* w, size_t wBytes,
-    void* y, size_t yBytes, ConvolutionParams params, const void* extra = nullptr, size_t extraBytes = 0);
+    void* y, size_t yBytes, ConvolutionParams params, const void* extra = nullptr, size_t extraBytes = 0,
+    std::vector<std::pair<uint32_t, double>>* timings = nullptr);

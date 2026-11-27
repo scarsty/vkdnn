@@ -14,6 +14,8 @@ layout(push_constant) uniform Params
 }
 p;
 shared float partial[64];
+shared float weightPartial[192];
+shared float tilePartial[768];
 bool nanBits(float v) { return (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u; }
 float product(float a, float b)
 {
@@ -187,12 +189,74 @@ float gradient(uint i)
 }
 void main()
 {
+    if (p.op == 4 && p.mode == 0 && p.kh == 2 && p.kw == 2 && p.sh == 2 && p.sw == 2 && p.ph == 0 && p.pw == 0)
+    {
+        uint block = gl_GlobalInvocationID.x;
+        uint columns = (p.w + 1) / 2, rows = (p.h + 1) / 2;
+        if (block >= (p.count / (p.h * p.w)) * rows * columns) { return; }
+        uint column = block % columns, row = (block / columns) % rows;
+        uint nc = block / (columns * rows);
+        uint base = nc * p.h * p.w + row * 2 * p.w + column * 2;
+        uint winner = 0xffffffffu;
+        float best = uintBitsToFloat(0xff800000u);
+        bool bad = false;
+        bool covered = row < p.oh && column < p.ow;
+        if (p.alpha != 0.0 && covered)
+        {
+            for (uint tap = 0; tap < 4; ++tap)
+            {
+                float value = x[p.aOffset + base + (tap / 2) * p.w + tap % 2];
+                if (nanBits(value)) { bad = bad || p.nan == 1; }
+                else if (winner == 0xffffffffu || value > best)
+                {
+                    best = value;
+                    winner = tap;
+                }
+            }
+        }
+        for (uint tap = 0; tap < 4; ++tap)
+        {
+            if (row * 2 + tap / 2 >= p.h || column * 2 + tap % 2 >= p.w) { continue; }
+            uint position = p.cOffset + base + (tap / 2) * p.w + tap % 2;
+            float result = 0.0;
+            if (p.alpha != 0.0)
+            {
+                float gradient = 0.0;
+                if (bad) { gradient = uintBitsToFloat(0x7fc00000u); }
+                else if (covered && winner == tap) { gradient = w[p.bOffset + (nc * p.oh + row) * p.ow + column]; }
+                result = product(p.alpha, gradient);
+            }
+            if (p.beta != 0.0) { result += product(p.beta, y[position]); }
+            if (nanBits(p.alpha) || nanBits(p.beta) || nanBits(result)) { result = uintBitsToFloat(0x7fc00000u); }
+            y[position] = result;
+        }
+        return;
+    }
     if (p.op == 8)
     {
         uint index = gl_GlobalInvocationID.x;
-        if (index >= p.count) { return; }
+        uint lane = gl_LocalInvocationID.x;
         float sum = 0.0;
-        for (uint split = 0; split < p.nan; ++split) { sum += x[p.aOffset + index * p.nan + split]; }
+        if (p.nan < 32)
+        {
+            if (index >= p.count) { return; }
+            for (uint split = 0; split < p.nan; ++split) { sum += x[p.aOffset + index * p.nan + split]; }
+        }
+        else
+        {
+            index = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+            if (index >= p.count) { return; }
+            for (uint split = lane; split < p.nan; split += 64) { sum += x[p.aOffset + index * p.nan + split]; }
+            tilePartial[lane] = sum;
+            barrier();
+            for (uint step = 32; step > 0; step /= 2)
+            {
+                if (lane < step) { tilePartial[lane] += tilePartial[lane + step]; }
+                barrier();
+            }
+            if (lane != 0) { return; }
+            sum = tilePartial[0];
+        }
         float result = product(p.alpha, sum);
         if (p.beta != 0.0) { result += product(p.beta, y[p.cOffset + index]); }
         if (nanBits(p.alpha) || nanBits(p.beta) || nanBits(result)) { result = uintBitsToFloat(0x7fc00000u); }
@@ -239,6 +303,89 @@ void main()
             if (p.beta != 0.0) { result += product(p.beta, y[p.cOffset + channel]); }
             if (nanBits(p.alpha) || nanBits(p.beta) || nanBits(result)) { result = uintBitsToFloat(0x7fc00000u); }
             y[p.cOffset + channel] = result;
+        }
+        return;
+    }
+    if (p.op == 12)
+    {
+        uint lane = gl_LocalInvocationID.x;
+        uint split = gl_WorkGroupID.x % p.nan;
+        uint tile = gl_WorkGroupID.x / p.nan;
+        uint fy = tile % 3;
+        uint channel = (tile / 3) % p.fc;
+        uint firstOc = tile / (3 * p.fc) * 4;
+        float sums[12];
+        for (uint entry = 0; entry < 12; ++entry) { sums[entry] = 0.0; }
+        for (uint position = split * 64 + lane; position < p.n * p.oh * p.ow; position += 64 * p.nan)
+        {
+            uint ox = position % p.ow;
+            uint oy = (position / p.ow) % p.oh;
+            uint batch = position / (p.oh * p.ow);
+            uint inputIndex = p.aOffset + ((batch * p.c + channel) * p.h + oy + fy) * p.w + ox;
+            float inputs[3];
+            for (uint tap = 0; tap < 3; ++tap) { inputs[tap] = x[inputIndex + tap]; }
+            for (uint outputChannel = 0; outputChannel < 4; ++outputChannel)
+            {
+                uint oc = firstOc + outputChannel;
+                if (oc >= p.k) { continue; }
+                float dy = w[p.bOffset + (batch * p.k + oc) * p.oh * p.ow + oy * p.ow + ox];
+                for (uint tap = 0; tap < 3; ++tap) { sums[outputChannel * 3 + tap] += product(inputs[tap], dy); }
+            }
+        }
+        for (uint entry = 0; entry < 12; ++entry) { tilePartial[entry * 64 + lane] = sums[entry]; }
+        barrier();
+        for (uint step = 32; step > 0; step >>= 1)
+        {
+            if (lane < step)
+            {
+                for (uint entry = 0; entry < 12; ++entry) { tilePartial[entry * 64 + lane] += tilePartial[entry * 64 + lane + step]; }
+            }
+            barrier();
+        }
+        if (lane == 0)
+        {
+            for (uint outputChannel = 0; outputChannel < 4; ++outputChannel)
+            {
+                uint oc = firstOc + outputChannel;
+                if (oc >= p.k) { continue; }
+                uint weightIndex = (oc * p.fc + channel) * 9 + fy * 3;
+                for (uint tap = 0; tap < 3; ++tap) { y[(weightIndex + tap) * p.nan + split] = tilePartial[(outputChannel * 3 + tap) * 64]; }
+            }
+        }
+        return;
+    }
+    if (p.op == 11)
+    {
+        uint lane = gl_LocalInvocationID.x;
+        uint split = gl_WorkGroupID.x % p.nan;
+        uint row = gl_WorkGroupID.x / p.nan;
+        uint weightIndex = row * 3;
+        uint fy = row % 3;
+        uint channel = (row / 3) % p.fc;
+        uint oc = row / (3 * p.fc);
+        float sums[3] = float[3](0.0, 0.0, 0.0);
+        for (uint position = split * 64 + lane; position < p.n * p.oh * p.ow; position += 64 * p.nan)
+        {
+            uint ox = position % p.ow;
+            uint oy = (position / p.ow) % p.oh;
+            uint batch = position / (p.oh * p.ow);
+            uint inputIndex = p.aOffset + ((batch * p.c + channel) * p.h + oy + fy) * p.w + ox;
+            float dy = w[p.bOffset + (batch * p.k + oc) * p.oh * p.ow + oy * p.ow + ox];
+            for (uint tap = 0; tap < 3; ++tap) { sums[tap] += product(x[inputIndex + tap], dy); }
+        }
+        for (uint tap = 0; tap < 3; ++tap) { weightPartial[tap * 64 + lane] = sums[tap]; }
+        barrier();
+        for (uint step = 32; step > 0; step >>= 1)
+        {
+            if (lane < step)
+            {
+                for (uint tap = 0; tap < 3; ++tap) { weightPartial[tap * 64 + lane] += weightPartial[tap * 64 + lane + step]; }
+            }
+            barrier();
+        }
+        if (lane == 0)
+        {
+            for (uint tap = 0; tap < 3; ++tap) { y[(weightIndex + tap) * p.nan + split] = weightPartial[tap * 64]; }
         }
         return;
     }

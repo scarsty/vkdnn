@@ -64,11 +64,13 @@ VKDNN_API vkdnnStatus_t vkdnnGetConvolutionBackwardDataAlgorithm_v7(vkdnnHandle_
 VKDNN_API vkdnnStatus_t vkdnnGetConvolutionBackwardFilterAlgorithm_v7(vkdnnHandle_t handle,
     vkdnnTensorDescriptor_t xDesc, vkdnnTensorDescriptor_t dyDesc, vkdnnConvolutionDescriptor_t convDesc,
     vkdnnFilterDescriptor_t dwDesc, int requestedAlgoCount, int* returnedAlgoCount, vkdnnConvolutionBwdFilterAlgoPerf_t* perfResults);
-/* Execute the sole algorithm once with alpha=1, beta=0, overwriting the destination.
- * time is measured host milliseconds for the complete synchronous operator call, including
- * pipeline/setup/submission/wait overhead, NOT pure GPU time. No warmup or averaging.
- * Errors preserve count/results; execution failures may modify the destination.
- * Data ranges and aliasing follow the corresponding convolution operator's contract. */
+/* Forward Find returns the sole DIRECT candidate without execution; time is NaN (unmeasured).
+ * Backward Find validates and benchmarks applicable local algorithms using temporary output,
+ * preserves the destination, and returns results sorted by measured milliseconds.
+ * Backward timings use GPU timestamps when supported, otherwise completed host timings.
+ * Successful results may be reused for the same device and descriptors; ordinary execution
+ * honors the explicit algorithm and never performs algorithm search.
+ * Errors preserve count/results. Data ranges and aliasing follow the operator contract. */
 VKDNN_API vkdnnStatus_t vkdnnFindConvolutionForwardAlgorithmEx(vkdnnHandle_t handle,
     vkdnnTensorDescriptor_t xDesc, const void* x, vkdnnFilterDescriptor_t wDesc, const void* w,
     vkdnnConvolutionDescriptor_t convDesc, vkdnnTensorDescriptor_t yDesc, void* y,

@@ -26,10 +26,12 @@ vkdnnStatus_t freeMemory(vkdnnHandle_t, vkdnnMemory_t);
 vkdnnStatus_t copyHtoD(vkdnnHandle_t, vkdnnMemory_t, size_t, const void*, size_t);
 vkdnnStatus_t copyDtoH(vkdnnHandle_t, void*, vkdnnMemory_t, size_t, size_t);
 vkdnnStatus_t copyDtoD(vkdnnHandle_t, vkdnnMemory_t, size_t, vkdnnMemory_t, size_t, size_t);
+vkdnnStatus_t copyDtoD2D(vkdnnHandle_t, vkdnnMemory_t, size_t, size_t, vkdnnMemory_t, size_t, size_t, size_t, size_t);
 vkdnnStatus_t setMemory(vkdnnHandle_t, vkdnnMemory_t, size_t, int, size_t);
 vkdnnError_t computeBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, const ComputeParams&);
 vkdnnError_t activationBackwardBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ActivationBackwardParams&);
 vkdnnError_t gemmBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const GemmParams&);
 vkdnnError_t reduceBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, float*, const GemmParams&);
-vkdnnError_t convolutionBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ConvolutionParams&);
+vkdnnError_t convolutionBuffers(vkdnnHandle_t, vkdnnMemory_t, vkdnnMemory_t, vkdnnMemory_t, const ConvolutionParams&,
+    std::vector<std::pair<uint32_t, double>>* timings = nullptr);
 }    //namespace vkdnnRuntime
